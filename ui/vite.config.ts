@@ -14,6 +14,10 @@ export default defineConfig({
   resolve: {
     alias: [
       { find: "@", replacement: path.resolve(import.meta.dirname, "./src") },
+      {
+        find: /^@monaco-editor\/react$/,
+        replacement: path.resolve(import.meta.dirname, "./src/components/monaco-react.tsx"),
+      },
       // monaco-editor >= 0.53 has an exports map ("./*.js": "./esm/vs/*.js"),
       // so legacy deep imports like "monaco-editor/esm/vs/..." no longer
       // resolve. monaco-worker-manager (used by monaco-yaml's worker) still
