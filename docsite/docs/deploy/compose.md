@@ -25,6 +25,7 @@ LOG_LEVEL = info
 |---|---|---|
 | `server` | The Server to deploy on. | — |
 | `file_paths` | List of compose files. Supports composing multiple files via `docker compose -f ... -f ...`. | `[]` |
+| `inline_files` | UI companion sources as `{ path, contents }` entries; these do not add Compose roots. | `[]` |
 | `run_directory` | Working directory for compose commands. | — |
 | `project_name` | Override the compose project name. Defaults to the Stack name. | Stack name |
 | `environment` | Environment variables written to a `.env` file and passed via `--env-file`. Supports [variable interpolation](../configuration/variables.md). | `""` |
@@ -46,6 +47,71 @@ Stacks support three ways to provide compose files:
 1. **Write in the UI** — Komodo writes the files to the host at deploy time.
 2. **Files on the host** — Point to existing files on the server.
 3. **Git repo** — Komodo clones the repo onto the host to deploy. Changes are tracked in git and you can use [webhooks](../automate/webhooks.md) to auto-redeploy on push.
+
+### Compose service discovery
+
+For non-Swarm Host, Git, and UI stacks, service refresh follows local Compose `include`
+dependencies. Keep `file_paths` as the ordered explicit roots; do not add included
+files as extra roots. Git discovery uses a separate temporary checkout pinned to
+the full revision selected by Core, without running repository or deployment hooks.
+Host discovery reads the current on-disk environment and does not apply undeployed
+changes to the Stack's `environment`.
+
+If `compose_cmd_wrapper_include` contains `config`, the trusted
+`compose_cmd_wrapper` also runs during background refresh. The default selection
+is `up`, so it does not enable refresh wrapping. Wrapper filesystem/network side
+effects remain the operator's responsibility.
+
+No-include refresh preserves source-only parsing. Include resolution requires compatible
+Core/Periphery versions and a Compose command that supports the configured includes;
+it does not require user or network namespace creation. Git checkout inputs must remain
+inside the discovery checkout; existing external Host paths remain allowed.
+
+UI stacks retain `file_contents` as their primary root. Supply included files in
+`inline_files` using unique normalized relative paths. Every explicit `file_paths`
+root must have supplied contents. Absolute paths, traversal, symlinks, file/directory
+collisions, `.git`, and collisions with the generated environment or ownership manifest
+are rejected. The complete supplied tree is limited to 512 files and 32 MiB of text.
+Primary and companion contents share variable/secret interpolation and its opt-out.
+In UI Defined mode, use **Add Companion File** to add source contents and rename
+their relative paths. Update the corresponding `include` references when renaming
+or removing files. **Explicit Compose Roots** remains a separate ordered list.
+Companion edits use the same save/unsaved-change workflow and write permissions
+as the primary editor.
+
+UI refresh uses a separate private temporary tree and never changes deployed input files.
+Deployment writes files with restricted permissions and records only owned companion
+paths in a private manifest. Removing a companion deletes only its previously owned file;
+unrelated files are retained, and existing unowned companions are never overwritten.
+Before deploy, pull, or run with companions, Core rechecks the additive discovery operation
+so an older Periphery cannot silently ignore them. UI companions currently require a
+Compose server target, not Swarm.
+
+Compose may access remote includes during background refresh, as it can during deployment.
+Remote include contents are not tracked as local dependencies, so source-based automatic
+change decisions are unavailable when they are present. Unsupported syntax and resource
+limits fail explicitly. No source fallback substitutes only explicit roots.
+
+Compatibility upgrades must move Core and Periphery together. An older Periphery with
+companions is rejected before deploy, pull, or run instead of silently deploying only
+the primary root. Swarm stacks remain on the existing deployment path.
+
+The trusted `compose_cmd_wrapper` runs for wrappers selected by
+`compose_cmd_wrapper_include`; background discovery may therefore inherit wrapper
+filesystem/network effects. The wrapper must contain `[[COMPOSE_COMMAND]]` exactly once
+when selected. Discovery never runs deploy hooks or repository hooks and never uses an
+active Git checkout.
+
+A failed refresh clears latest service discovery, reports a safe error, and blocks
+change-driven deployment and automatic update decisions without changing deployed state.
+For a full deployment without a command wrapper, Periphery checks the local source
+snapshot immediately before and after Compose runs. If the sources changed during
+deployment, or the snapshot cannot be verified, the deployment can still succeed but
+source-based change comparisons stop with an error. Remote includes, command wrappers,
+and selective service deployments cannot currently produce a verified deployed snapshot.
+For change-driven restarts, Periphery checks the sources before and after the restart.
+If they differ before the restart, it stops without restarting. If they change during the
+restart, the deployed snapshot is incomplete until a verified full deployment.
 
 ## Importing Existing Projects
 

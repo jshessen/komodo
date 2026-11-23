@@ -54,3 +54,55 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  compose-include:
+    name: Compose Include Conformance
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Install verified Docker Compose
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.docker/cli-plugins"
+          curl -fsSL \
+            -o "$HOME/.docker/cli-plugins/docker-compose" \
+            "https://github.com/docker/compose/releases/download/v5.7.0/docker-compose-linux-x86_64"
+          chmod 0755 "$HOME/.docker/cli-plugins/docker-compose"
+          docker compose version
+          docker compose version --short | grep -Fx '5.7.0'
+          command -v openssl
+
+      - name: Build private resolver executable
+        run: cargo build --locked -p komodo_periphery --bin periphery
+
+      - name: Run real-CLI conformance
+        shell: bash
+        env:
+          CARGO_BUILD_JOBS: 2
+          KOMODO_COMPOSE_RESOLVER_EXE: ${{ github.workspace }}/target/debug/periphery
+        run: |
+          set -o pipefail
+          cargo test --locked -p komodo_periphery compose_include_cli \
+            -- --ignored --nocapture --test-threads=1 |
+            tee compose-include-cli.log
+          if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed;' compose-include-cli.log; then
+            echo "Compose conformance selected zero passing cases" >&2
+            exit 1
+          fi
+
+      - name: Preserve conformance log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-include-cli-log
+          path: compose-include-cli.log
+          if-no-files-found: warn
