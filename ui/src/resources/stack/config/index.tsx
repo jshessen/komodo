@@ -33,6 +33,7 @@ import SecretsSearch from "@/components/config/secrets-search";
 import { MonacoEditor } from "mogh_ui";
 import { EnableSwitch } from "mogh_ui";
 import StackConfigFiles from "./config-files";
+import StackInlineFiles from "./inline-files";
 import SystemCommand from "@/components/config/system-command";
 import { Link } from "react-router-dom";
 import AddExtraArg from "@/components/config/add-extra-arg";
@@ -124,6 +125,7 @@ export default function StackConfig({
         ...update,
         files_on_host: false,
         repo: "",
+        linked_repo: "",
         file_contents:
           update.file_contents ||
           config.file_contents ||
@@ -134,7 +136,9 @@ export default function StackConfig({
         ...update,
         files_on_host: false,
         repo: "",
+        linked_repo: "",
         file_contents: "",
+        inline_files: [],
       });
     }
   };
@@ -936,7 +940,7 @@ export default function StackConfig({
         ...swarmServerGroup,
         {
           label: "Compose File",
-          description: "Manage the compose file contents here.",
+          description: "Manage primary and companion source files here.",
           actions: (
             <ShowHideButton
               show={show.file}
@@ -945,6 +949,17 @@ export default function StackConfig({
           ),
           contentHidden: !show.file,
           fields: {
+            file_paths: (value, set) => (
+              <ConfigList
+                label="Explicit Compose Roots"
+                description="Ordered -f inputs only. The first path names the primary file; other roots need companion contents. Empty uses compose.yaml. Do not list includes as extra roots."
+                field="file_paths"
+                values={value ?? []}
+                set={set}
+                disabled={disabled}
+                placeholder="compose.yaml"
+              />
+            ),
             file_contents: (file_contents, set) => {
               const show_default =
                 !file_contents &&
@@ -957,7 +972,7 @@ export default function StackConfig({
                     value={
                       show_default ? DEFAULT_STACK_FILE_CONTENTS : file_contents
                     }
-                    filename="compose.yaml"
+                    filename={`stack-${id}-primary.yaml`}
                     onValueChange={(file_contents) => set({ file_contents })}
                     language="yaml"
                     readOnly={disabled}
@@ -965,6 +980,19 @@ export default function StackConfig({
                 </Stack>
               );
             },
+            inline_files: (value, set) => (
+              <StackInlineFiles
+                stackId={id}
+                value={value}
+                primary={
+                  (update.file_paths ?? config.file_paths)?.[0] ||
+                  "compose.yaml"
+                }
+                envFile={update.env_file_path ?? config.env_file_path ?? ".env"}
+                set={set}
+                disabled={disabled}
+              />
+            ),
           },
         },
         environment,

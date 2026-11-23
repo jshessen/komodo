@@ -190,7 +190,7 @@ export default function StackInfo({
                   value={edits[content.path] ?? content.contents}
                   language={languageFromPath(content.path)}
                   readOnly={!canEdit}
-                  filename={content.path}
+                  filename={`stack-${id}-source-${encodeURIComponent(content.path)}`}
                   onValueChange={editFileCallback(content.path)}
                 />
               )}

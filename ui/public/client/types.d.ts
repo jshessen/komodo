@@ -2632,6 +2632,12 @@ export interface StackFileDependency {
     /** Specify */
     requires?: StackFileRequires;
 }
+export interface FileContents {
+    /** The path to the file */
+    path: string;
+    /** The contents of the file */
+    contents: string;
+}
 /** The compose file configuration. */
 export interface StackConfig {
     /**
@@ -2844,6 +2850,11 @@ export interface StackConfig {
      */
     file_contents?: string;
     /**
+     * UI companion sources, relative to the managed source directory.
+     * These are not additional Compose roots unless explicitly listed in file_paths.
+     */
+    inline_files?: FileContents[];
+    /**
      * The environment variables passed to the compose file.
      * They will be written to path defined in env_file_path,
      * which is given relative to the run directory.
@@ -2853,12 +2864,6 @@ export interface StackConfig {
      * Note. Not used in Swarm mode.
      */
     environment?: string;
-}
-export interface FileContents {
-    /** The path to the file */
-    path: string;
-    /** The contents of the file */
-    contents: string;
 }
 export interface StackServiceNames {
     /** The name of the service */

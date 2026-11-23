@@ -873,6 +873,16 @@
             "null"
           ]
         },
+        "inline_files": {
+          "description": "UI companion sources, relative to the managed source directory.\nThese are not additional Compose roots unless explicitly listed in file_paths.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/FileContents"
+          }
+        },
         "environment": {
           "description": "The environment variables passed to the compose file.\nThey will be written to path defined in env_file_path,\nwhich is given relative to the run directory.\n\nIf it is empty, no file will be written.\n\nNote. Not used in Swarm mode.",
           "type": [
@@ -963,6 +973,23 @@
           "default": false
         }
       }
+    },
+    "FileContents": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "The path to the file",
+          "type": "string"
+        },
+        "contents": {
+          "description": "The contents of the file",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "contents"
+      ]
     },
     "ResourceToml4": {
       "type": "object",
