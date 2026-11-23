@@ -120,8 +120,7 @@ pub fn output_into_log(
 
 /// Commands are run directly, and cannot include '&&'.
 ///
-/// See [CommandOptions] for the available `timeout` / `cancel` / `stdin`
-/// controls.
+/// See [CommandOptions] for execution controls.
 pub async fn run_standard_command(
   command: &str,
   options: CommandOptions<'_>,
@@ -163,8 +162,7 @@ fn shell() -> &'static str {
 
 /// Commands are wrapped in 'sh -c', and can include '&&'.
 ///
-/// See [CommandOptions] for the available `timeout` / `cancel` / `stdin`
-/// controls.
+/// See [CommandOptions] for execution controls.
 pub async fn run_shell_command(
   command: &str,
   options: CommandOptions<'_>,
@@ -196,7 +194,20 @@ async fn run_command(
     timeout,
     cancel,
     stdin,
+    env,
+    output_limit,
+    inherit_process_group,
   } = options;
+
+  if inherit_process_group && (timeout.is_some() || cancel.is_some())
+  {
+    return CommandOutput::from_err_message(
+      "Inherited process-group commands require parent timeout/cancellation".into(),
+    );
+  }
+  if let Some(env) = env {
+    cmd.envs(env);
+  }
 
   // Attach the path to cmd as current dir
   if let Some(path) = path {
@@ -217,7 +228,11 @@ async fn run_command(
 
   // Fast path: nothing to write, and nothing to wait
   // on besides the command itself.
-  if timeout.is_none() && cancel.is_none() && stdin.is_none() {
+  if timeout.is_none()
+    && cancel.is_none()
+    && stdin.is_none()
+    && output_limit.is_none()
+  {
     return CommandOutput::from(cmd.output().await);
   }
 
@@ -227,7 +242,11 @@ async fn run_command(
 
   // Place the child in a new process group so the whole group can be
   // signalled together. Only needed when there is something to signal on.
-  if timeout.is_some() || cancel.is_some() {
+  if !inherit_process_group
+    && (timeout.is_some()
+      || cancel.is_some()
+      || output_limit.is_some())
+  {
     cmd.process_group(0);
   }
 
@@ -250,12 +269,23 @@ async fn run_command(
     });
   }
 
-  // Because of `process_group(0)`, the child's pid equals its pgid.
+  // The child's pid is also its pgid only when we own the process group.
   let pid = child.id();
+
+  let output = async move {
+    match output_limit {
+      Some(limit) => bounded_output(child, limit).await,
+      None => child.wait_with_output().await,
+    }
+  };
 
   // Nothing to signal on, so just wait for it to finish.
   if timeout.is_none() && cancel.is_none() {
-    return CommandOutput::from(child.wait_with_output().await);
+    let output = output.await;
+    if output_limit.is_some() && !inherit_process_group {
+      kill_process_group(pid);
+    }
+    return CommandOutput::from(output);
   }
 
   // Resolve to `()` only when the relevant control fires; otherwise stay
@@ -274,7 +304,10 @@ async fn run_command(
   };
 
   let killed_reason = tokio::select! {
-    output = child.wait_with_output() => {
+    output = output => {
+      if output_limit.is_some() && !inherit_process_group {
+        kill_process_group(pid);
+      }
       return CommandOutput::from(output);
     }
     _ = on_timeout => format!(
@@ -289,6 +322,48 @@ async fn run_command(
 
   kill_process_group(pid);
   CommandOutput::from_err_message(killed_reason)
+}
+
+async fn bounded_output(
+  mut child: tokio::process::Child,
+  limit: usize,
+) -> std::io::Result<std::process::Output> {
+  let (stdout, stderr, status) = tokio::try_join!(
+    read_bounded(child.stdout.take(), limit),
+    read_bounded(child.stderr.take(), limit),
+    child.wait(),
+  )?;
+  for bytes in [&stdout, &stderr] {
+    std::str::from_utf8(bytes).map_err(|_| {
+      std::io::Error::other("Command output is not valid UTF-8")
+    })?;
+  }
+  Ok(std::process::Output {
+    status,
+    stdout,
+    stderr,
+  })
+}
+
+async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(
+  pipe: Option<R>,
+  limit: usize,
+) -> std::io::Result<Vec<u8>> {
+  use tokio::io::AsyncReadExt;
+  let pipe = pipe.ok_or_else(|| {
+    std::io::Error::other("Command output pipe is unavailable")
+  })?;
+  let mut bytes = Vec::new();
+  pipe
+    .take(limit.saturating_add(1) as u64)
+    .read_to_end(&mut bytes)
+    .await?;
+  if bytes.len() > limit {
+    return Err(std::io::Error::other(
+      "Command output limit exceeded",
+    ));
+  }
+  Ok(bytes)
 }
 
 /// Sends `SIGKILL` to the entire process group led by `pid`.
@@ -314,6 +389,168 @@ mod tests {
   use tokio_util::sync::CancellationToken;
 
   use super::*;
+
+  #[tokio::test]
+  async fn compose_include_output_limit_exact_boundary() {
+    let output = run_standard_command(
+      "head -c 64 /dev/zero",
+      CommandOptions::default().output_limit(64),
+    )
+    .await;
+    assert!(output.success(), "{output:?}");
+    assert_eq!(output.stdout.len(), 64);
+    let output = run_standard_command(
+      "head -c 65 /dev/zero",
+      CommandOptions::default().output_limit(64),
+    )
+    .await;
+    assert!(!output.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.contains("output limit"));
+  }
+
+  #[tokio::test]
+  async fn compose_include_stderr_output_limit_with_timeout() {
+    let output = run_shell_command(
+      "head -c 65 /dev/zero >&2",
+      CommandOptions::default()
+        .output_limit(64)
+        .timeout(Duration::from_secs(5)),
+    )
+    .await;
+    assert!(!output.success());
+    assert!(output.stderr.contains("output limit"));
+  }
+
+  #[tokio::test]
+  async fn compose_include_bounded_output_rejects_invalid_utf8() {
+    for command in ["printf '\\377'", "printf '\\377' >&2"] {
+      let output = run_shell_command(
+        command,
+        CommandOptions::default().output_limit(64),
+      )
+      .await;
+      assert!(!output.success(), "{output:?}");
+      assert!(output.stdout.is_empty());
+      assert!(output.stderr.contains("not valid UTF-8"));
+    }
+  }
+
+  #[tokio::test]
+  async fn compose_include_nested_capture_inherits_parent_group() {
+    // SAFETY: getpgrp has no arguments or memory access.
+    let parent_group = unsafe { libc::getpgrp() }.to_string();
+    let output = run_shell_command(
+      "ps -o pgid= -p $$",
+      CommandOptions::default()
+        .output_limit(64)
+        .inherit_process_group(true),
+    )
+    .await;
+    assert!(output.success(), "{output:?}");
+    assert_eq!(output.stdout.trim(), parent_group);
+
+    for options in [
+      CommandOptions::default().timeout(Duration::from_secs(5)),
+      CommandOptions::default().cancel(CancellationToken::new()),
+    ] {
+      let output = run_shell_command(
+        "printf unexpected",
+        options.output_limit(64).inherit_process_group(true),
+      )
+      .await;
+      assert!(!output.success());
+      assert!(output.stdout.is_empty());
+      assert!(
+        output
+          .stderr
+          .contains("require parent timeout/cancellation")
+      );
+    }
+  }
+
+  #[tokio::test]
+  async fn compose_include_bounded_success_cleans_residual_descendants()
+   {
+    let output = run_shell_command(
+      "sleep 30 >/dev/null 2>&1 & printf '%s %s' \"$$\" \"$!\"",
+      CommandOptions::default().output_limit(64),
+    )
+    .await;
+    assert!(output.success(), "{output:?}");
+    let pids = output
+      .stdout
+      .split_whitespace()
+      .map(|pid| pid.parse::<u32>().unwrap())
+      .collect::<Vec<_>>();
+    let [group, descendant] = pids.as_slice() else {
+      panic!("expected owned group and descendant identifiers");
+    };
+    let running = || match std::fs::read_to_string(format!(
+      "/proc/{descendant}/stat"
+    )) {
+      Ok(stat) => !stat.rsplit_once(") ").unwrap().1.starts_with('Z'),
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        false
+      }
+      Err(error) => panic!("cannot check owned descendant: {error}"),
+    };
+    for _ in 0..50 {
+      if !running() {
+        return;
+      }
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    kill_process_group(Some(*group));
+    panic!("owned descendant survived bounded command completion");
+  }
+
+  #[tokio::test]
+  async fn compose_include_child_environment_is_scoped_on_both_paths()
+  {
+    let variable = "COMPOSE_EXPERIMENTAL_GIT_REMOTE";
+    let parent = std::env::var_os(variable);
+    let disabled = std::collections::BTreeMap::from([(
+      variable.to_string(),
+      "false".to_string(),
+    )]);
+    let enabled = std::collections::BTreeMap::from([(
+      variable.to_string(),
+      "true".to_string(),
+    )]);
+
+    let (fast, spawned) = tokio::join!(
+      run_standard_command(
+        "printenv COMPOSE_EXPERIMENTAL_GIT_REMOTE",
+        CommandOptions::default().env(&disabled),
+      ),
+      run_shell_command(
+        "printf '%s' \"$COMPOSE_EXPERIMENTAL_GIT_REMOTE\"",
+        CommandOptions::default()
+          .env(&enabled)
+          .timeout(Duration::from_secs(10)),
+      ),
+    );
+    assert!(fast.success(), "{fast:?}");
+    assert!(spawned.success(), "{spawned:?}");
+    assert_eq!(fast.stdout.trim(), "false");
+    assert_eq!(spawned.stdout, "true");
+    assert_eq!(std::env::var_os(variable), parent);
+
+    let inherited = run_shell_command(
+      "printf '%s' \"$COMPOSE_EXPERIMENTAL_GIT_REMOTE\"",
+      CommandOptions::default(),
+    )
+    .await;
+    assert!(inherited.success(), "{inherited:?}");
+    assert_eq!(
+      inherited.stdout,
+      parent
+        .as_ref()
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_default()
+    );
+  }
 
   /// On timeout, a backgrounded grandchild (here `sleep 31337`, started
   /// with `&` so it is not the direct child of our spawned shell) must be

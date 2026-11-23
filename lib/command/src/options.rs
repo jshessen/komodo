@@ -1,12 +1,12 @@
-use std::{path::Path, time::Duration};
+use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use tokio_util::sync::CancellationToken;
 
 /// Controls for how a command is executed.
 ///
-/// When either timeout or cancel is set, the child is spawned in its own process group so
-/// that, on timeout or cancellation, the entire group (the command and any
-/// descendants it spawned) is killed together — not just the direct child.
+/// Timeout, cancellation, or an output limit creates an owned process group,
+/// unless explicitly inheriting a supervised parent's group. Controls kill
+/// the owned group, not just the direct child.
 #[derive(Default, Clone)]
 pub struct CommandOptions<'a> {
   /// Run the command at a particular path
@@ -25,6 +25,17 @@ pub struct CommandOptions<'a> {
   /// secret into the command, it never appears in the process arguments,
   /// where any user on the host could read it out of `ps`.
   pub stdin: Option<&'a str>,
+  /// Override these variables in this child only; inherit all others.
+  pub env: Option<&'a BTreeMap<String, String>>,
+  /// Maximum bytes captured from each output stream. Exceeding it fails
+  /// without returning truncated output. Owned groups are cleaned up on
+  /// completion, including success, to stop residual descendants.
+  /// Bounded text capture rejects invalid UTF-8 instead of substituting it.
+  pub output_limit: Option<usize>,
+  /// For a nested worker whose parent supervises the whole process group.
+  /// Cannot be combined with this command's own timeout or cancellation.
+  /// The parent must clean up descendants when this nested command fails.
+  pub inherit_process_group: bool,
 }
 
 impl<'a> CommandOptions<'a> {
@@ -37,9 +48,30 @@ impl<'a> CommandOptions<'a> {
     self.stdin = stdin.into();
     self
   }
+
+  pub fn env(
+    mut self,
+    env: impl Into<Option<&'a BTreeMap<String, String>>>,
+  ) -> Self {
+    self.env = env.into();
+    self
+  }
 }
 
 impl CommandOptions<'_> {
+  pub fn inherit_process_group(mut self, inherit: bool) -> Self {
+    self.inherit_process_group = inherit;
+    self
+  }
+
+  pub fn output_limit(
+    mut self,
+    output_limit: impl Into<Option<usize>>,
+  ) -> Self {
+    self.output_limit = output_limit.into();
+    self
+  }
+
   pub fn timeout(
     mut self,
     timeout: impl Into<Option<Duration>>,
