@@ -37,6 +37,15 @@ use super::{
   resource::{Resource, ResourceListItem, ResourceQuery},
 };
 
+mod inline;
+pub use inline::{
+  INLINE_MANIFEST, MAX_INLINE_BYTES, MAX_INLINE_FILES,
+  validate_inline_path,
+};
+
+pub mod resolution;
+pub use resolution::*;
+
 #[cfg(feature = "utoipa")]
 #[derive(utoipa::ToSchema)]
 #[schema(as = Stack)]
@@ -115,6 +124,13 @@ impl Stack {
     res.extend(
       self.config.config_files.iter().map(|f| f.path.clone()),
     );
+    res.extend(
+      self
+        .config
+        .inline_files
+        .iter()
+        .map(|file| file.path.clone()),
+    );
     res.into_iter().collect()
   }
 
@@ -132,6 +148,9 @@ impl Stack {
         .map(|p| StackFileDependency::full_redeploy(p.to_string())),
     );
     res.extend(self.config.config_files.clone());
+    res.extend(self.config.inline_files.iter().map(|file| {
+      StackFileDependency::full_redeploy(file.path.clone())
+    }));
     res.into_iter().collect()
   }
 }
@@ -307,6 +326,33 @@ pub struct StackInfo {
   pub latest_hash: Option<String>,
   /// Latest commit message, or null
   pub latest_message: Option<String>,
+
+  /// Internal resolution identity and dependency fingerprints, excluded from public responses.
+  #[serde(default, skip_serializing)]
+  #[typeshare(skip)]
+  #[cfg_attr(feature = "utoipa", schema(ignore))]
+  pub resolution: Option<ComposeResolutionState>,
+
+  /// Separately preserved dependency evidence for the last accepted deployment.
+  #[serde(default, skip_serializing)]
+  #[typeshare(skip)]
+  #[cfg_attr(feature = "utoipa", schema(ignore))]
+  pub deployed_resolution: Option<AcceptedComposeResolution>,
+}
+
+impl StackInfo {
+  /// Persist private cache evidence without exposing it through normal API serialization.
+  pub fn to_document(&self) -> bson::ser::Result<Document> {
+    let mut document = bson::to_document(self)?;
+    if let Some(resolution) = &self.resolution {
+      document.insert("resolution", bson::to_bson(resolution)?);
+    }
+    if let Some(resolution) = &self.deployed_resolution {
+      document
+        .insert("deployed_resolution", bson::to_bson(resolution)?);
+    }
+    Ok(document)
+  }
 }
 
 #[typeshare(serialized_as = "Partial<StackConfig>")]
@@ -660,6 +706,12 @@ pub struct StackConfig {
   #[builder(default)]
   pub file_contents: String,
 
+  /// UI companion sources, relative to the managed source directory.
+  /// These are not additional Compose roots unless explicitly listed in file_paths.
+  #[serde(default)]
+  #[builder(default)]
+  pub inline_files: Vec<FileContents>,
+
   /// The environment variables passed to the compose file.
   /// They will be written to path defined in env_file_path,
   /// which is given relative to the run directory.
@@ -731,6 +783,7 @@ impl Default for StackConfig {
       registry_provider: Default::default(),
       registry_account: Default::default(),
       file_contents: Default::default(),
+      inline_files: Default::default(),
       auto_pull: default_auto_pull(),
       poll_for_updates: Default::default(),
       auto_update: Default::default(),
@@ -1025,6 +1078,38 @@ pub struct ComposeFile {
   pub name: Option<String>,
   #[serde(default)]
   pub services: HashMap<String, ComposeService>,
+}
+
+impl ComposeFile {
+  /// Preserve the source-only refresh merge rules without expanding replicas.
+  pub fn append_source_services(
+    self,
+    project: &str,
+    digests: &HashMap<String, ImageDigest>,
+    services: &mut Vec<StackServiceNames>,
+  ) {
+    for (name, service) in self.services {
+      if let Some(existing) =
+        services.iter_mut().find(|s| s.service_name == name)
+      {
+        if let Some(container) = service.container_name {
+          existing.container_name = container;
+        }
+        if let Some(image) = service.image {
+          existing.image = image;
+        }
+      } else {
+        services.push(StackServiceNames {
+          container_name: service
+            .container_name
+            .unwrap_or_else(|| format!("{project}-{name}")),
+          image_digest: digests.get(&name).cloned(),
+          image: service.image.unwrap_or_default(),
+          service_name: name,
+        });
+      }
+    }
+  }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

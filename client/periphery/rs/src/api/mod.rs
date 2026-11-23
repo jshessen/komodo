@@ -94,6 +94,10 @@ pub struct DeployStackResponse {
   pub logs: Vec<Log>,
   /// Whether stack was successfully deployed
   pub deployed: bool,
+  /// Source evidence observed before and after a successful deploy.
+  #[serde(default)]
+  pub deployed_resolution:
+    Option<komodo_client::entities::stack::AcceptedComposeResolution>,
   /// The stack services.
   ///
   /// Note. The "image" is after interpolation.

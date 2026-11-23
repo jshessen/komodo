@@ -1,0 +1,5 @@
+services:
+  root:
+    image: conformance/root:synthetic
+include:
+  - modules/compose.yaml

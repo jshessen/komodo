@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::Context;
 use komodo_client::entities::{
   ImageDigest,
-  stack::{ComposeFile, ComposeService, Stack, StackServiceNames},
+  stack::{ComposeFile, Stack, StackServiceNames},
 };
 
 pub fn extract_services_from_stack(
@@ -38,38 +38,10 @@ pub fn extract_services_into_res(
         "failed to parse service names from compose contents",
       )?;
 
-  for (
-    service_name,
-    ComposeService {
-      container_name,
-      image,
-      ..
-    },
-  ) in compose.services
-  {
-    if let Some(existing) =
-      res.iter_mut().find(|s| s.service_name == service_name)
-    {
-      // Override any defined fields
-      if let Some(container_name) = container_name {
-        existing.container_name = container_name;
-      }
-      if let Some(image) = image {
-        existing.image = image;
-      }
-    } else {
-      res.push(StackServiceNames {
-        container_name: container_name.unwrap_or_else(|| {
-          format!("{project_name}-{service_name}")
-        }),
-        image_digest: service_image_digests
-          .get(&service_name)
-          .cloned(),
-        image: image.unwrap_or_default(),
-        service_name,
-      });
-    }
-  }
-
+  compose.append_source_services(
+    project_name,
+    service_image_digests,
+    res,
+  );
   Ok(())
 }

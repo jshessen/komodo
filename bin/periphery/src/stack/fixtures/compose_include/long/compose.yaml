@@ -1,0 +1,6 @@
+include:
+  - path:
+      - module/compose.yaml
+      - module/override.yaml
+    project_directory: ./project
+    env_file: ./include.env

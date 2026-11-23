@@ -1,0 +1,5 @@
+services:
+  module:
+    image: conformance/module:synthetic
+include:
+  - child/compose.yaml

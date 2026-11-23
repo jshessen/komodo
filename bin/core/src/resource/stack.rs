@@ -276,7 +276,8 @@ impl super::KomodoResource for Stack {
     config: &mut Self::PartialConfig,
     user: &User,
   ) -> anyhow::Result<()> {
-    validate_config(config, user).await
+    validate_config(config, user).await?;
+    validate_inline_sources(&config.clone().into())
   }
 
   async fn post_create(
@@ -333,11 +334,28 @@ impl super::KomodoResource for Stack {
   }
 
   async fn validate_update_config(
-    _id: &str,
+    id: &str,
     config: &mut Self::PartialConfig,
     user: &User,
   ) -> anyhow::Result<()> {
-    validate_config(config, user).await
+    validate_config(config, user).await?;
+    let existing = super::get::<Stack>(id).await?;
+    let mut candidate = serde_json::to_value(&existing.config)?;
+    let update = serde_json::to_value(config)?;
+    candidate
+      .as_object_mut()
+      .context("Stack config must be an object")?
+      .extend(
+        update
+          .as_object()
+          .context("Stack config update must be an object")?
+          .clone(),
+      );
+    let candidate =
+      serde_json::from_value(candidate).map_err(|_| {
+        anyhow::anyhow!("Invalid Stack source configuration")
+      })?;
+    validate_inline_sources(&candidate)
   }
 
   async fn post_update(
@@ -474,6 +492,20 @@ impl super::KomodoResource for Stack {
 }
 
 #[instrument("ValidateStackConfig", skip_all)]
+fn validate_inline_sources(
+  config: &StackConfig,
+) -> anyhow::Result<()> {
+  if !config.files_on_host
+    && config.repo.is_empty()
+    && config.linked_repo.is_empty()
+    && (!config.file_contents.is_empty()
+      || !config.inline_files.is_empty())
+  {
+    config.inline_sources()?;
+  }
+  Ok(())
+}
+
 async fn validate_config(
   config: &mut PartialStackConfig,
   user: &User,
@@ -517,4 +549,35 @@ async fn validate_config(
     config.linked_repo = Some(repo.id);
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use komodo_client::entities::FileContents;
+
+  #[test]
+  fn compose_include_inline_validation_respects_active_source_precedence()
+  -> anyhow::Result<()> {
+    let mut config = StackConfig::default();
+    config.file_contents = "services: {}".into();
+    config.inline_files = vec![FileContents {
+      path: "../escape".into(),
+      contents: String::new(),
+    }];
+    assert!(validate_inline_sources(&config).is_err());
+    config.files_on_host = true;
+    validate_inline_sources(&config)?;
+    config.files_on_host = false;
+    config.repo = "synthetic/repository".into();
+    validate_inline_sources(&config)?;
+    config.repo.clear();
+    config.linked_repo = "linked".into();
+    validate_inline_sources(&config)?;
+    config.linked_repo.clear();
+    assert!(validate_inline_sources(&config).is_err());
+    config.inline_files[0].path = "child.yaml".into();
+    validate_inline_sources(&config)?;
+    Ok(())
+  }
 }

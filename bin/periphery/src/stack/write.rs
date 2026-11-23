@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{os::unix::fs::DirBuilderExt, path::PathBuf};
 
 use anyhow::{Context, anyhow};
 use formatting::format_serror;
@@ -12,7 +12,6 @@ use periphery_client::api::{
   compose::{ComposePullResponse, ComposeRunResponse},
   git::{CloneRepo, PullOrCloneRepo},
 };
-use tokio::fs;
 
 use crate::{api::Args, config::periphery_config, helpers};
 
@@ -319,11 +318,7 @@ async fn write_stack_ui_defined(
   // env_file_path
   Option<&str>,
 )> {
-  if stack.config.file_contents.trim().is_empty() {
-    return Err(anyhow!(
-      "Must either input compose file contents directly, or use files on host / git repo options."
-    ));
-  }
+  stack.config.inline_sources()?;
 
   let run_directory = periphery_config()
     .stack_dir()
@@ -332,11 +327,21 @@ async fn write_stack_ui_defined(
     .collect::<PathBuf>();
 
   // Ensure run directory exists
-  fs::create_dir_all(&run_directory).await.with_context(|| {
-    format!(
-      "failed to create stack run directory at {run_directory:?}"
-    )
-  })?;
+  std::fs::DirBuilder::new()
+    .recursive(true)
+    .mode(0o700)
+    .create(&run_directory)
+    .with_context(|| {
+      format!(
+        "failed to create stack run directory at {run_directory:?}"
+      )
+    })?;
+  super::inline::write_sources(&run_directory, &stack.config)?;
+  super::inline::checked_path(
+    &run_directory,
+    &stack.config.env_file_path,
+    true,
+  )?;
   let env_file_path = environment::write_env_file(
     &stack.config.env_vars()?,
     run_directory.as_path(),
@@ -347,28 +352,6 @@ async fn write_stack_ui_defined(
   if !all_logs_success(res.logs()) {
     return Err(anyhow!("Failed to write env file, stopping run"));
   }
-
-  let file_path = run_directory
-    .join(
-      stack
-        .config
-        .file_paths
-        // only need the first one, or default
-        .first()
-        .map(String::as_str)
-        .unwrap_or("compose.yaml"),
-    )
-    .components()
-    .collect::<PathBuf>();
-
-  mogh_secret_file::write_async(
-    &file_path,
-    &stack.config.file_contents,
-  )
-  .await
-  .with_context(|| {
-    format!("Failed to write compose file to {file_path:?}")
-  })?;
 
   Ok((
     run_directory,
@@ -394,4 +377,215 @@ fn stack_git_token<R: WriteStackRes>(
     });
     anyhow!("failed to find required git token, stopping run")
   })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::super::inline::{PrivateSourceTree, write_sources};
+  use super::*;
+  use std::os::unix::fs::{PermissionsExt, symlink};
+
+  fn inline_stack() -> Stack {
+    let mut stack = Stack::default();
+    stack.config.file_contents =
+      "include: [modules/child.yaml]\n".into();
+    stack.config.inline_files = vec![FileContents {
+      path: "modules/child.yaml".into(),
+      contents: "services: {child: {image: synthetic/child}}".into(),
+    }];
+    stack
+  }
+
+  #[test]
+  fn compose_include_inline_materializes_and_removes_only_owned_companions()
+  -> anyhow::Result<()> {
+    let tree = PrivateSourceTree::new()?;
+    let mut stack = inline_stack();
+    std::fs::write(tree.path().join("unmanaged.txt"), "keep")?;
+    std::fs::write(
+      tree.path().join("compose.yaml"),
+      "legacy primary",
+    )?;
+    std::fs::set_permissions(
+      tree.path().join("compose.yaml"),
+      std::fs::Permissions::from_mode(0o644),
+    )?;
+    write_sources(tree.path(), &stack.config)?;
+    assert_eq!(
+      std::fs::metadata(tree.path().join("compose.yaml"))?
+        .permissions()
+        .mode()
+        & 0o777,
+      0o600
+    );
+    let child = tree.path().join("modules/child.yaml");
+    assert_eq!(
+      std::fs::read_to_string(&child)?,
+      stack.config.inline_files[0].contents
+    );
+    assert_eq!(
+      std::fs::metadata(&child)?.permissions().mode() & 0o777,
+      0o600
+    );
+    assert_eq!(
+      std::fs::metadata(child.parent().unwrap())?
+        .permissions()
+        .mode()
+        & 0o777,
+      0o700
+    );
+    assert!(
+      !std::fs::read_to_string(
+        tree
+          .path()
+          .join(komodo_client::entities::stack::INLINE_MANIFEST)
+      )?
+      .contains("synthetic/child")
+    );
+    stack.config.inline_files[0].path = "renamed/child.yaml".into();
+    stack.config.file_contents =
+      "include: [renamed/child.yaml]".into();
+    write_sources(tree.path(), &stack.config)?;
+    assert!(!child.exists());
+    assert!(tree.path().join("renamed/child.yaml").is_file());
+    stack.config.file_contents = "services: {}".into();
+    stack.config.inline_files.clear();
+    write_sources(tree.path(), &stack.config)?;
+    assert!(!child.exists());
+    assert!(!tree.path().join("renamed/child.yaml").exists());
+    assert_eq!(
+      std::fs::read_to_string(tree.path().join("unmanaged.txt"))?,
+      "keep"
+    );
+    assert_eq!(
+      std::fs::read_to_string(tree.path().join("compose.yaml"))?,
+      "services: {}"
+    );
+    tree.close()?;
+    Ok(())
+  }
+
+  #[test]
+  fn compose_include_inline_rejects_unowned_files_symlinks_and_corrupt_manifests()
+  -> anyhow::Result<()> {
+    let tree = PrivateSourceTree::new()?;
+    let outside = PrivateSourceTree::new()?;
+    let stack = inline_stack();
+    std::fs::write(outside.path().join("child.yaml"), "untouched")?;
+    symlink(outside.path(), tree.path().join("modules"))?;
+    assert!(write_sources(tree.path(), &stack.config).is_err());
+    std::fs::remove_file(tree.path().join("modules"))?;
+    std::fs::create_dir(tree.path().join("modules"))?;
+    symlink(
+      outside.path().join("child.yaml"),
+      tree.path().join("modules/child.yaml"),
+    )?;
+    assert!(write_sources(tree.path(), &stack.config).is_err());
+    std::fs::remove_file(tree.path().join("modules/child.yaml"))?;
+    std::fs::write(
+      tree.path().join("modules/child.yaml"),
+      "user file",
+    )?;
+    assert!(write_sources(tree.path(), &stack.config).is_err());
+    assert_eq!(
+      std::fs::read_to_string(
+        tree.path().join("modules/child.yaml")
+      )?,
+      "user file"
+    );
+    assert_eq!(
+      std::fs::read_to_string(outside.path().join("child.yaml"))?,
+      "untouched"
+    );
+    std::fs::remove_file(tree.path().join("modules/child.yaml"))?;
+    std::fs::write(
+      tree
+        .path()
+        .join(komodo_client::entities::stack::INLINE_MANIFEST),
+      "[\"../escape\"]",
+    )?;
+    assert!(write_sources(tree.path(), &stack.config).is_err());
+    assert!(!tree.path().join("compose.yaml").exists());
+    tree.close()?;
+    outside.close()?;
+    Ok(())
+  }
+
+  #[test]
+  fn compose_include_inline_sources_validate_paths_roots_and_collisions()
+  -> anyhow::Result<()> {
+    let mut stack = inline_stack();
+    assert_eq!(stack.config.inline_sources()?.len(), 2);
+    let long_component = "x".repeat(256);
+    for path in [
+      long_component.as_str(),
+      "",
+      "../escape.yaml",
+      "/absolute.yaml",
+      "a/../b.yaml",
+      "./child.yaml",
+      "a//b.yaml",
+      "a\\b.yaml",
+      ".git/config",
+      ".env",
+      "compose.yaml",
+      "modules/child.yaml/descendant",
+    ] {
+      let mut invalid = stack.clone();
+      if path == "modules/child.yaml/descendant" {
+        invalid.config.inline_files.push(FileContents {
+          path: path.into(),
+          contents: String::new(),
+        });
+      } else {
+        invalid.config.inline_files[0].path = path.into();
+      }
+      assert!(invalid.config.inline_sources().is_err(), "{path}");
+    }
+    stack.config.file_paths =
+      vec!["compose.yaml".into(), "missing.yaml".into()];
+    assert!(stack.config.inline_sources().is_err());
+    stack.config.file_paths[1] = "modules/child.yaml".into();
+    assert_eq!(stack.config.inline_sources()?.len(), 2);
+    stack.config.inline_files.clear();
+    stack.config.file_paths.clear();
+    assert_eq!(
+      stack.config.inline_sources()?,
+      [("compose.yaml", stack.config.file_contents.as_str())]
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn compose_include_inline_sources_enforce_exact_count_and_byte_limits()
+  -> anyhow::Result<()> {
+    use komodo_client::entities::stack::{
+      MAX_INLINE_BYTES, MAX_INLINE_FILES,
+    };
+    let mut stack = inline_stack();
+    stack.config.inline_files = (1..MAX_INLINE_FILES)
+      .map(|index| FileContents {
+        path: format!("file-{index}.yaml"),
+        contents: String::new(),
+      })
+      .collect();
+    assert_eq!(
+      stack.config.inline_sources()?.len(),
+      MAX_INLINE_FILES
+    );
+    stack.config.inline_files.push(FileContents {
+      path: "extra.yaml".into(),
+      contents: String::new(),
+    });
+    assert!(stack.config.inline_sources().is_err());
+    stack.config.inline_files = vec![FileContents {
+      path: "large.txt".into(),
+      contents: "x"
+        .repeat(MAX_INLINE_BYTES - stack.config.file_contents.len()),
+    }];
+    stack.config.inline_sources()?;
+    stack.config.inline_files[0].contents.push('x');
+    assert!(stack.config.inline_sources().is_err());
+    Ok(())
+  }
 }

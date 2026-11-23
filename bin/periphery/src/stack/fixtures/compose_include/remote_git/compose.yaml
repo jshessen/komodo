@@ -1,0 +1,2 @@
+include:
+  - https://compose-include.invalid/never-fetch.git#main

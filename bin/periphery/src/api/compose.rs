@@ -1,6 +1,5 @@
 use std::{
-  borrow::Cow, fmt::Write, path::PathBuf, sync::LazyLock,
-  time::Duration,
+  borrow::Cow, path::PathBuf, sync::LazyLock, time::Duration,
 };
 
 use anyhow::{Context, anyhow};
@@ -15,8 +14,7 @@ use interpolate::Interpolator;
 use komodo_client::{
   entities::{
     FileContents, RepoExecutionResponse, all_logs_success,
-    stack::{AdditionalEnvFile, StackRemoteFileContents},
-    to_path_compatible_name,
+    stack::StackRemoteFileContents, to_path_compatible_name,
     update::Log,
   },
   parsers::parse_multiline_command,
@@ -28,7 +26,10 @@ use tracing::Instrument;
 
 use crate::{
   config::periphery_config,
-  docker::compose::{docker_compose, parse_compose_services},
+  docker::compose::{
+    ConfigFormat, compose_command, config_command, docker_compose,
+    ordered_env_files, parse_compose_services,
+  },
   helpers::{format_extra_args, format_log_grep},
   stack::{
     maybe_login_registry, pull_or_clone_stack, validate_files,
@@ -357,14 +358,18 @@ impl Resolve<crate::api::Args> for ComposePull {
       format!(" -- {}", services.join(" "))
     };
 
-    let file_args = stack.compose_file_paths().join(" -f ");
-
-    let env_file_args = env_file_args(
+    let env_files = ordered_env_files(
       env_file_path,
       &stack.config.additional_env_files,
-    )?;
+    );
 
     let project_name = stack.project_name(false);
+    let compose_command = compose_command(
+      docker_compose,
+      &project_name,
+      stack.compose_file_paths(),
+      &env_files,
+    );
 
     // Parse wrapper configuration
     let compose_cmd_wrapper =
@@ -380,9 +385,8 @@ impl Resolve<crate::api::Args> for ComposePull {
         &stack.config.compose_cmd_wrapper_include
       };
 
-    let pull_command = format!(
-      "{docker_compose} -p {project_name} -f {file_args}{env_file_args} pull{service_args}",
-    );
+    let pull_command =
+      format!("{compose_command} pull{service_args}");
     let (pull_command, wrapped) = match maybe_wrap_command(
       pull_command,
       &compose_cmd_wrapper,
@@ -448,6 +452,7 @@ impl Resolve<crate::api::Args> for ComposeUp {
       git_token,
       registry_token,
       mut replacers,
+      expected_resolution,
     } = self;
 
     let mut res = DeployStackResponse::default();
@@ -530,17 +535,21 @@ impl Resolve<crate::api::Args> for ComposeUp {
       format!(" -- {}", services.join(" "))
     };
 
-    let file_args = stack.compose_file_paths().join(" -f ");
-
     // This will be the last project name, which is the one that needs to be destroyed.
     // Might be different from the current project name, if user renames stack / changes to custom project name.
     let last_project_name = stack.project_name(false);
     let project_name = stack.project_name(true);
 
-    let env_file_args = env_file_args(
+    let env_files = ordered_env_files(
       env_file_path,
       &stack.config.additional_env_files,
-    )?;
+    );
+    let compose_command = compose_command(
+      docker_compose,
+      &project_name,
+      stack.compose_file_paths(),
+      &env_files,
+    );
 
     // Parse wrapper configuration once for reuse
     let compose_cmd_wrapper =
@@ -556,11 +565,32 @@ impl Resolve<crate::api::Args> for ComposeUp {
         &stack.config.compose_cmd_wrapper_include
       };
 
+    let verifiable = expected_resolution.as_ref().filter(|_| {
+      services.is_empty()
+        && stack.config.compose_cmd_wrapper.trim().is_empty()
+    });
+    let before_config = if let Some(expected) = verifiable {
+      deployment_evidence(
+        &stack,
+        &run_directory,
+        &env_files,
+        expected,
+        &replacers,
+      )
+      .await
+    } else {
+      None
+    };
+
     // Uses 'docker compose config' command to extract services (including image)
     // after performing interpolation
     {
-      let command = format!(
-        "{docker_compose} -p {project_name} -f {file_args}{env_file_args} config",
+      let command = config_command(
+        docker_compose,
+        &project_name,
+        stack.compose_file_paths(),
+        &env_files,
+        ConfigFormat::Yaml,
       );
       let (command, wrapped) = match maybe_wrap_command(
         command,
@@ -625,11 +655,27 @@ impl Resolve<crate::api::Args> for ComposeUp {
       res.logs.push(config_log);
     }
 
+    let config_evidence = if let (Some(expected), Some(before)) =
+      (verifiable, before_config)
+    {
+      let after = deployment_evidence(
+        &stack,
+        &run_directory,
+        &env_files,
+        expected,
+        &replacers,
+      )
+      .await;
+      (after.as_ref() == Some(&before)).then_some(before)
+    } else {
+      None
+    };
+
     if stack.config.run_build {
       let build_extra_args =
         format_extra_args(&stack.config.build_extra_args);
       let command = format!(
-        "{docker_compose} -p {project_name} -f {file_args}{env_file_args} build{build_extra_args}{service_args}",
+        "{compose_command} build{build_extra_args}{service_args}",
       );
       let (command, wrapped) = match maybe_wrap_command(
         command,
@@ -671,9 +717,7 @@ impl Resolve<crate::api::Args> for ComposeUp {
     if stack.config.auto_pull {
       // Pull images before destroying to minimize downtime.
       // If this fails, do not continue.
-      let command = format!(
-        "{docker_compose} -p {project_name} -f {file_args}{env_file_args} pull{service_args}",
-      );
+      let command = format!("{compose_command} pull{service_args}");
       let (command, wrapped) = match maybe_wrap_command(
         command,
         &compose_cmd_wrapper,
@@ -723,9 +767,8 @@ impl Resolve<crate::api::Args> for ComposeUp {
 
     // Run compose up
     let extra_args = format_extra_args(&stack.config.extra_args);
-    let command = format!(
-      "{docker_compose} -p {project_name} -f {file_args}{env_file_args} up -d{extra_args}{service_args}",
-    );
+    let command =
+      format!("{compose_command} up -d{extra_args}{service_args}");
     let (command, _) = match maybe_wrap_command(
       command,
       &compose_cmd_wrapper,
@@ -737,6 +780,21 @@ impl Resolve<crate::api::Args> for ComposeUp {
         res.logs.push(log);
         return Ok(res);
       }
+    };
+
+    let before = if let (Some(expected), Some(_)) =
+      (verifiable, &config_evidence)
+    {
+      deployment_evidence(
+        &stack,
+        &run_directory,
+        &env_files,
+        expected,
+        &replacers,
+      )
+      .await
+    } else {
+      None
     };
 
     let span = info_span!("ExecuteComposeUp");
@@ -755,6 +813,32 @@ impl Resolve<crate::api::Args> for ComposeUp {
 
     res.deployed = log.success;
     res.logs.push(log);
+    if let Some(expected) = verifiable
+      && res.deployed
+      && let Some(before) = before
+      && config_evidence.as_ref() == Some(&before)
+    {
+      let after = deployment_evidence(
+        &stack,
+        &run_directory,
+        &env_files,
+        expected,
+        &replacers,
+      )
+      .await;
+      if after.as_ref() == Some(&before) {
+        res.deployed_resolution = Some(before);
+      }
+    }
+    if res.deployed
+      && expected_resolution.is_some()
+      && res.deployed_resolution.is_none()
+    {
+      res.logs.push(Log::simple(
+        "Compose source tracking",
+        "Deployment succeeded, but its source snapshot could not be verified. Automatic source-change comparisons are unavailable until a verified deployment.".into(),
+      ));
+    }
 
     if res.deployed && !stack.config.post_deploy.is_none() {
       let post_deploy_path =
@@ -779,6 +863,59 @@ impl Resolve<crate::api::Args> for ComposeUp {
     }
 
     Ok(res)
+  }
+}
+
+async fn deployment_evidence(
+  stack: &komodo_client::entities::stack::Stack,
+  directory: &std::path::Path,
+  env_files: &[String],
+  expected: &komodo_client::entities::stack::AcceptedComposeResolution,
+  replacers: &[(String, String)],
+) -> Option<komodo_client::entities::stack::AcceptedComposeResolution>
+{
+  use komodo_client::entities::stack::ComposeResolutionSource;
+  let (source_matches, revision) =
+    match &expected.source_identity.request_identity.source {
+      ComposeResolutionSource::Host { .. } => {
+        (stack.config.files_on_host, None)
+      }
+      ComposeResolutionSource::Repository { .. } => {
+        if stack.config.files_on_host {
+          (false, None)
+        } else {
+          match git::get_commit_info(directory).await {
+            Ok(commit) => (true, Some(commit.id)),
+            Err(_) => {
+              warn!("Unable to verify deployed Git revision");
+              (false, None)
+            }
+          }
+        }
+      }
+      ComposeResolutionSource::Ui => (
+        !stack.config.files_on_host
+          && stack.config.repo.is_empty()
+          && stack.config.linked_repo.is_empty(),
+        None,
+      ),
+    };
+  if !source_matches {
+    return None;
+  }
+  match crate::stack::resolve::deployment_snapshot(
+    stack,
+    directory,
+    env_files,
+    expected,
+    replacers,
+    revision.as_deref(),
+  ) {
+    Ok(snapshot) => snapshot,
+    Err(error) => {
+      warn!(%error, "Unable to verify deployed Compose sources");
+      None
+    }
   }
 }
 
@@ -808,6 +945,127 @@ impl Resolve<crate::api::Args> for ComposeExecution {
     )
     .await;
     Ok(log)
+  }
+}
+
+impl Resolve<crate::api::Args> for ComposeRestartObserved {
+  async fn resolve(
+    self,
+    _: &crate::api::Args,
+  ) -> anyhow::Result<ComposeRestartObservedResponse> {
+    let ComposeRestartObserved {
+      project,
+      mut stack,
+      repo,
+      services,
+      expected_resolution,
+      mut replacers,
+    } = self;
+    let mut interpolator =
+      Interpolator::new(None, &periphery_config().secrets);
+    interpolator.interpolate_stack(&mut stack)?;
+    replacers.extend(interpolator.secret_replacers);
+
+    let directory = if stack.config.files_on_host {
+      periphery_config()
+        .stack_dir()
+        .join(to_path_compatible_name(&stack.name))
+        .join(&stack.config.run_directory)
+    } else if let Some(repo) = &repo {
+      periphery_config()
+        .repo_dir()
+        .join(to_path_compatible_name(&repo.name))
+        .join(&repo.config.path)
+        .join(&stack.config.run_directory)
+    } else if !stack.config.repo.is_empty() {
+      periphery_config()
+        .stack_dir()
+        .join(to_path_compatible_name(&stack.name))
+        .join(&stack.config.clone_path)
+        .join(&stack.config.run_directory)
+    } else {
+      periphery_config()
+        .stack_dir()
+        .join(to_path_compatible_name(&stack.name))
+    };
+    let generated = directory
+      .join(&stack.config.env_file_path)
+      .is_file()
+      .then_some(stack.config.env_file_path.as_str());
+    let env_files = ordered_env_files(
+      generated,
+      &stack.config.additional_env_files,
+    );
+    let command = format!(
+      "{} -p {project} restart{}",
+      docker_compose(),
+      if services.is_empty() {
+        String::new()
+      } else {
+        format!(" {}", services.join(" "))
+      }
+    );
+    let expected = expected_resolution.clone();
+    Ok(
+      observed_restart(
+        &expected_resolution,
+        move || {
+          let stack = stack.clone();
+          let directory = directory.clone();
+          let env_files = env_files.clone();
+          let expected = expected.clone();
+          let replacers = replacers.clone();
+          async move {
+            deployment_evidence(
+              &stack, &directory, &env_files, &expected, &replacers,
+            )
+            .await
+          }
+        },
+        move || async move {
+          run_komodo_standard_command(
+            "Compose Command",
+            command,
+            CommandOptions::default(),
+          )
+          .await
+        },
+      )
+      .await,
+    )
+  }
+}
+
+pub(crate) async fn observed_restart<O, OF, R, RF>(
+  expected: &komodo_client::entities::stack::AcceptedComposeResolution,
+  mut observe: O,
+  run: R,
+) -> ComposeRestartObservedResponse
+where
+  O: FnMut() -> OF + Send,
+  OF: std::future::Future<
+      Output = Option<
+        komodo_client::entities::stack::AcceptedComposeResolution,
+      >,
+    > + Send,
+  R: FnOnce() -> RF + Send,
+  RF: std::future::Future<Output = Log> + Send,
+{
+  let before = observe().await;
+  if before.as_ref() != Some(expected) {
+    return ComposeRestartObservedResponse {
+        log: Log::error(
+          "Compose source tracking",
+          "Stack sources changed or could not be verified before restart. Refresh and retry.".into(),
+        ),
+        observed_resolution: None,
+      };
+  }
+  let log = run().await;
+  let after = if log.success { observe().await } else { None };
+  ComposeRestartObservedResponse {
+    log,
+    observed_resolution: after.filter(|value| value == expected),
   }
 }
 
@@ -884,18 +1142,18 @@ impl Resolve<crate::api::Args> for ComposeRun {
 
     let docker_compose = docker_compose();
 
-    let file_args = if stack.config.file_paths.is_empty() {
-      String::from("compose.yaml")
-    } else {
-      stack.config.file_paths.join(" -f ")
-    };
-
-    let env_file_args = env_file_args(
+    let env_files = ordered_env_files(
       env_file_path,
       &stack.config.additional_env_files,
-    )?;
+    );
 
     let project_name = stack.project_name(true);
+    let compose_command = compose_command(
+      docker_compose,
+      &project_name,
+      stack.compose_file_paths(),
+      &env_files,
+    );
 
     // Comes straight off the request and interpolated into a
     // command string which is handed to `bash -c`, so must be escaped.
@@ -917,9 +1175,8 @@ impl Resolve<crate::api::Args> for ComposeRun {
       };
 
     if pull.unwrap_or_default() {
-      let pull_command = format!(
-        "{docker_compose} -p {project_name} -f {file_args}{env_file_args} pull -- {service}",
-      );
+      let pull_command =
+        format!("{compose_command} pull -- {service}");
       let (pull_command, wrapped) = match maybe_wrap_command(
         pull_command,
         &compose_cmd_wrapper,
@@ -1000,7 +1257,7 @@ impl Resolve<crate::api::Args> for ComposeRun {
       .unwrap_or_default();
 
     let run_command = format!(
-      "{docker_compose} -p {project_name} -f {file_args}{env_file_args} run{run_flags} -- {service}{command_args}",
+      "{compose_command} run{run_flags} -- {service}{command_args}",
     );
     let (run_command, _) = match maybe_wrap_command(
       run_command,
@@ -1030,37 +1287,10 @@ impl Resolve<crate::api::Args> for ComposeRun {
   }
 }
 
-fn env_file_args(
-  env_file_path: Option<&str>,
-  additional_env_files: &[AdditionalEnvFile],
-) -> anyhow::Result<String> {
-  let mut res = String::new();
-
-  // Add additional env files (except komodo's own, which comes last)
-  for file in additional_env_files
-    .iter()
-    .filter(|f| env_file_path != Some(f.path.as_str()))
-  {
-    let path = &file.path;
-    write!(res, " --env-file {path}").with_context(|| {
-      format!("Failed to write --env-file arg for {path}")
-    })?;
-  }
-
-  // Add komodo's env file last for highest priority
-  if let Some(file) = env_file_path {
-    write!(res, " --env-file {file}").with_context(|| {
-      format!("Failed to write --env-file arg for {file}")
-    })?;
-  }
-
-  Ok(res)
-}
-
 /// Apply compose_cmd_wrapper to command if the subcommand is in wrapper_include list.
 /// Returns Ok((command, wrapped)) where `wrapped` indicates if wrapper was applied.
 /// Returns Err(Log) if wrapper is invalid (missing placeholder).
-fn maybe_wrap_command(
+pub(crate) fn maybe_wrap_command(
   command: String,
   wrapper: &str,
   wrapper_include: &[String],
@@ -1112,4 +1342,157 @@ async fn compose_down(
   }
 
   Ok(())
+}
+
+impl Resolve<crate::api::Args> for ResolveComposeStack {
+  async fn resolve(
+    self,
+    args: &crate::api::Args,
+  ) -> anyhow::Result<Self::Response> {
+    use periphery_client::api::compose::ResolveComposeStackResponse;
+    if let Err(error) = self.validate() {
+      return Ok(ResolveComposeStackResponse::Failure {
+        request_identity: None,
+        error,
+      });
+    }
+    Ok(
+      crate::stack::resolve::resolve_sources(
+        self,
+        args.core.clone(),
+        periphery_config(),
+      )
+      .await,
+    )
+  }
+}
+
+#[cfg(test)]
+mod resolution_tests {
+  use super::*;
+  use crate::api::{Args, PeripheryRequest};
+  use komodo_client::entities::stack::{
+    AcceptedComposeResolution, ComposeResolutionErrorKind,
+    ComposeResolutionSource, ComposeSourceIdentity,
+    ObservedComposeSnapshot, ResolutionRequestIdentity, Stack,
+  };
+
+  #[tokio::test]
+  async fn compose_include_restart_requires_stable_observed_sources()
+  {
+    use std::sync::{
+      Arc,
+      atomic::{AtomicUsize, Ordering},
+    };
+    let expected = AcceptedComposeResolution {
+      source_identity: ComposeSourceIdentity {
+        request_identity: ResolutionRequestIdentity {
+          stack_id: "stack".into(),
+          config_generation: "generation".into(),
+          source: ComposeResolutionSource::Host {
+            server_id: "server".into(),
+            run_directory: ".".into(),
+          },
+        },
+        observed_snapshot: ObservedComposeSnapshot {
+          complete: true,
+          dependency_fingerprints: Vec::new(),
+          commit_id: None,
+          config_generation: None,
+        },
+      },
+      dependencies: Vec::new(),
+    };
+    for (before, after, succeeds) in [
+      (false, true, true),
+      (true, false, true),
+      (true, true, false),
+      (true, true, true),
+    ] {
+      let observations = Arc::new(AtomicUsize::new(0));
+      let executions = Arc::new(AtomicUsize::new(0));
+      let observed = expected.clone();
+      let count = observations.clone();
+      let runs = executions.clone();
+      let response = observed_restart(
+        &expected,
+        move || {
+          let index = count.fetch_add(1, Ordering::SeqCst);
+          let observed = observed.clone();
+          async move {
+            (if index == 0 { before } else { after })
+              .then_some(observed)
+          }
+        },
+        move || async move {
+          runs.fetch_add(1, Ordering::SeqCst);
+          if succeeds {
+            Log::simple("restart", "ok".into())
+          } else {
+            Log::error("restart", "failed".into())
+          }
+        },
+      )
+      .await;
+      assert_eq!(
+        executions.load(Ordering::SeqCst),
+        usize::from(before)
+      );
+      assert_eq!(response.log.success, before && succeeds);
+      assert_eq!(
+        response.observed_resolution.is_some(),
+        before && after && succeeds
+      );
+    }
+  }
+
+  #[tokio::test]
+  async fn compose_resolution_dispatch_rejects_invalid_ui_identity()
+  -> anyhow::Result<()> {
+    {
+      let mut stack = Stack::default();
+      stack.id = "a".repeat(24);
+      stack.config.file_contents = "synthetic-secret".into();
+      let request = ResolveComposeStack {
+        request_identity: ResolutionRequestIdentity {
+          stack_id: "another-stack".into(),
+          config_generation: "generation".into(),
+          source: ComposeResolutionSource::Ui,
+        },
+        stack,
+        repo: None,
+        git_token: Some("synthetic-secret".into()),
+        replacers: Vec::new(),
+      };
+      let encoded = serde_json::json!({"type":"ResolveComposeStack","params":request});
+      let request: PeripheryRequest =
+        serde_json::from_value(encoded)?;
+      assert!(!format!("{request:?}").contains("synthetic-secret"));
+      let PeripheryRequest::ResolveComposeStack(request) = request
+      else {
+        panic!("Resolver request was not registered");
+      };
+      let response = request
+        .resolve(&Args {
+          core: "synthetic".into(),
+          id: uuid::Uuid::new_v4(),
+        })
+        .await?;
+      let ResolveComposeStackResponse::Failure {
+        request_identity,
+        error,
+      } = response
+      else {
+        panic!(
+          "Invalid requests must never produce a successful snapshot"
+        );
+      };
+      assert!(request_identity.is_none());
+      assert_eq!(
+        error.category,
+        ComposeResolutionErrorKind::InvalidIdentity
+      );
+    }
+    Ok(())
+  }
 }

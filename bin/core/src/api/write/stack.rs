@@ -3,10 +3,7 @@ use std::{collections::HashMap, path::PathBuf, sync::OnceLock};
 use anyhow::{Context, anyhow};
 use database::{
   bson::to_bson,
-  mungos::{
-    by_id::update_one_by_id,
-    mongodb::bson::{doc, to_document},
-  },
+  mungos::{by_id::update_one_by_id, mongodb::bson::doc},
 };
 use formatting::format_serror;
 use futures_util::{StreamExt as _, stream::FuturesOrdered};
@@ -65,7 +62,6 @@ impl Resolve<WriteArgs> for CreateStack {
     fields(
       operator = user.id,
       stack = self.name,
-      config = serde_json::to_string(&self.config).unwrap(),
     )
   )]
   async fn resolve(
@@ -127,7 +123,6 @@ impl Resolve<WriteArgs> for UpdateStack {
     fields(
       operator = user.id,
       stack = self.id,
-      update = serde_json::to_string(&self.config).unwrap(),
     )
   )]
   async fn resolve(
@@ -137,7 +132,8 @@ impl Resolve<WriteArgs> for UpdateStack {
     let compose_update = self.config.linked_repo.is_some()
       || self.config.repo.is_some()
       || self.config.files_on_host.is_some()
-      || self.config.file_contents.is_some();
+      || self.config.file_contents.is_some()
+      || self.config.inline_files.is_some();
 
     let stack =
       resource::update::<Stack>(&self.id, self.config, user).await?;
@@ -496,6 +492,12 @@ impl Resolve<WriteArgs> for RefreshStackCache {
       return Ok(NoData {});
     }
 
+    if crate::stack::discovery::uses_discovery(&stack, repo.as_ref())
+    {
+      crate::stack::discovery::refresh(stack, repo).await?;
+      return Ok(NoData {});
+    }
+
     let mut missing_files = Vec::new();
     let service_image_digests = stack
       .info
@@ -586,9 +588,7 @@ impl Resolve<WriteArgs> for RefreshStackCache {
       let RemoteComposeContents {
         successful: remote_contents,
         errored: remote_errors,
-        hash: latest_hash,
-        message: latest_message,
-        ..
+        revision,
       } = get_repo_compose_contents(
         &stack,
         repo.as_ref(),
@@ -622,8 +622,10 @@ impl Resolve<WriteArgs> for RefreshStackCache {
         services,
         Some(remote_contents),
         Some(remote_errors),
-        latest_hash,
-        latest_message,
+        revision
+          .as_ref()
+          .map(|revision| revision.display.hash.clone()),
+        revision.map(|revision| revision.display.message),
       )
     } else {
       // =============
@@ -659,9 +661,12 @@ impl Resolve<WriteArgs> for RefreshStackCache {
       remote_errors,
       latest_hash,
       latest_message,
+      resolution: stack.info.resolution.clone(),
+      deployed_resolution: stack.info.deployed_resolution.clone(),
     };
 
-    let info = to_document(&info)
+    let info = info
+      .to_document()
       .context("failed to serialize stack info to bson")?;
 
     db_client()
@@ -760,6 +765,7 @@ pub async fn check_stack_for_update_inner(
 
   // Query again after refresh
   let mut stack = resource::get::<Stack>(&stack).await?;
+  crate::stack::discovery::ensure_change_comparable(&stack).await?;
 
   let cache = image_digest_cache();
 

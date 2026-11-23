@@ -13,6 +13,50 @@ pub struct Interpolator<'a> {
   pub secret_replacers: HashSet<(String, String)>,
 }
 
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use komodo_client::entities::FileContents;
+
+  #[test]
+  fn compose_include_inline_interpolation_preserves_opt_out_and_redacts_secrets()
+  -> anyhow::Result<()> {
+    for skip in [false, true] {
+      let mut stack = Stack::default();
+      stack.config.skip_secret_interp = skip;
+      stack.config.file_contents =
+        "include: [modules/child.yaml]".into();
+      stack.config.inline_files = vec![FileContents {
+        path: "modules/child.yaml".into(),
+        contents: "services:\n  app:\n    image: [[IMAGE]]\n    environment:\n      TOKEN: [[TOKEN]]\n".into(),
+      }];
+      let variables =
+        HashMap::from([("IMAGE".into(), "synthetic/app".into())]);
+      let secrets =
+        HashMap::from([("TOKEN".into(), "synthetic-secret".into())]);
+      let mut interpolator =
+        Interpolator::new(Some(&variables), &secrets);
+      interpolator.interpolate_stack(&mut stack)?;
+      let text = &stack.config.inline_files[0].contents;
+      if skip {
+        assert!(text.contains("[[TOKEN]]"));
+        assert!(interpolator.secret_replacers.is_empty());
+      } else {
+        assert!(text.contains("synthetic/app"));
+        assert!(text.contains("synthetic-secret"));
+        let replacers = interpolator
+          .secret_replacers
+          .into_iter()
+          .collect::<Vec<_>>();
+        let redacted = svi::replace_in_string(text, &replacers);
+        assert!(!redacted.contains("synthetic-secret"));
+        assert!(redacted.contains("<TOKEN>"));
+      }
+    }
+    Ok(())
+  }
+}
+
 impl<'a> Interpolator<'a> {
   pub fn new(
     variables: Option<&'a HashMap<String, String>>,
@@ -40,7 +84,11 @@ impl<'a> Interpolator<'a> {
       .interpolate_string(&mut stack.config.post_deploy.command)?
       .interpolate_string(&mut stack.config.compose_cmd_wrapper)?
       .interpolate_extra_args(&mut stack.config.extra_args)?
-      .interpolate_extra_args(&mut stack.config.build_extra_args)
+      .interpolate_extra_args(&mut stack.config.build_extra_args)?;
+    for file in &mut stack.config.inline_files {
+      self.interpolate_string(&mut file.contents)?;
+    }
+    Ok(self)
   }
 
   pub fn interpolate_repo(

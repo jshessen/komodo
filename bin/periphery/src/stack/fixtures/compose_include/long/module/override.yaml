@@ -1,0 +1,4 @@
+services:
+  module:
+    environment:
+      INCLUDE_SENTINEL: synthetic-not-a-secret

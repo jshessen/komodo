@@ -97,8 +97,21 @@ async fn app() -> anyhow::Result<()> {
   Ok(())
 }
 
+fn main() -> anyhow::Result<()> {
+  let mode = std::env::args_os().nth(1);
+  if mode.as_deref()
+    == Some(std::ffi::OsStr::new(stack::resolve::WORKER_FLAG))
+  {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()?;
+    return runtime.block_on(stack::resolve::worker_entry());
+  }
+  agent_entry()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn agent_entry() -> anyhow::Result<()> {
   // Handle `periphery key gen` and `periphery key compute <private-key>`
   if let Some(Command::Key { command }) = &periphery_args().command {
     return mogh_pki::cli::handle(command, mogh_pki::PkiKind::Mutual)

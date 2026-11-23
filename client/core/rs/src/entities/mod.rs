@@ -428,8 +428,11 @@ pub struct LatestCommit {
 }
 
 #[typeshare]
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(
+  Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FileContents {
   /// The path to the file
   pub path: String,

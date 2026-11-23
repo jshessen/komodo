@@ -10,6 +10,7 @@ use crate::{
   permission::get_check_permissions,
 };
 
+pub mod discovery;
 pub mod execute;
 pub mod remote;
 pub mod services;

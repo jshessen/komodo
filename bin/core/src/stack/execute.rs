@@ -1,16 +1,23 @@
-use anyhow::anyhow;
+use std::sync::Arc;
+
+use anyhow::{anyhow, ensure};
 use komodo_client::{
   api::execute::*,
   entities::{
     SwarmOrServer,
     permission::PermissionLevel,
+    repo::Repo,
     server::Server,
-    stack::{Stack, StackActionState},
+    stack::{
+      AcceptedComposeResolution, ComposeResolutionState, Stack,
+      StackActionState,
+    },
     update::{Log, Update},
     user::User,
   },
 };
 use periphery_client::api::compose::*;
+use tokio::sync::Mutex;
 
 use crate::{
   helpers::{periphery_client, update::update_update},
@@ -141,13 +148,54 @@ impl ExecuteCompose for StartStack {
 }
 
 impl ExecuteCompose for RestartStack {
-  type Extras = ();
+  type Extras = Option<RestartObservation>;
   async fn execute(
     periphery: PeripheryClient,
     stack: Stack,
     services: Vec<String>,
-    _: Self::Extras,
+    observation: Self::Extras,
   ) -> anyhow::Result<Log> {
+    if let Some(observation) = observation {
+      let repo = if !stack.config.files_on_host
+        && !stack.config.linked_repo.is_empty()
+      {
+        Some(
+          crate::resource::get::<Repo>(&stack.config.linked_repo)
+            .await?,
+        )
+      } else {
+        None
+      };
+      ensure!(
+        matches!(&stack.info.resolution, Some(ComposeResolutionState::Success(current)) if current == &observation.expected)
+          && crate::stack::discovery::generation(
+            &stack,
+            repo.as_ref()
+          )? == observation
+            .expected
+            .source_identity
+            .request_identity
+            .config_generation,
+        "Stack configuration changed before restart"
+      );
+      let response = periphery
+        .request(ComposeRestartObserved {
+          project: stack.project_name(false),
+          stack: observation.stack,
+          repo: observation.repo,
+          services,
+          expected_resolution: observation.expected.clone(),
+          replacers: observation.replacers,
+        })
+        .await?;
+      if response.observed_resolution.as_ref()
+        == Some(&observation.expected)
+      {
+        *observation.result.lock().await =
+          response.observed_resolution;
+      }
+      return Ok(response.log);
+    }
     let service_args = service_args(&services);
     periphery
       .request(ComposeExecution {
@@ -156,6 +204,14 @@ impl ExecuteCompose for RestartStack {
       })
       .await
   }
+}
+
+pub struct RestartObservation {
+  pub stack: Stack,
+  pub repo: Option<Repo>,
+  pub expected: AcceptedComposeResolution,
+  pub replacers: Vec<(String, String)>,
+  pub result: Arc<Mutex<Option<AcceptedComposeResolution>>>,
 }
 
 impl ExecuteCompose for PauseStack {

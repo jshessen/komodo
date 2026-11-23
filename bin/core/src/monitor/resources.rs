@@ -7,8 +7,8 @@ use komodo_client::entities::{
     service::SwarmServiceListItem, stack::SwarmStackListItem,
   },
   stack::{
-    Stack, StackService, StackServiceNames, StackServiceState,
-    StackState,
+    ComposeResolutionState, Stack, StackService, StackServiceNames,
+    StackServiceState, StackState,
   },
   swarm::SwarmState,
 };
@@ -204,11 +204,19 @@ pub async fn update_server_stack_cache(
       }
     }).collect::<Vec<_>>();
 
-    let current_state = get_stack_state_from_containers(
-      &stack.config.ignore_services,
-      &services,
-      containers,
-    );
+    let current_state = if stack.info.deployed_services.is_none()
+      && matches!(
+        stack.info.resolution,
+        Some(ComposeResolutionState::Failed { .. })
+      ) {
+      StackState::Unknown
+    } else {
+      get_stack_state_from_containers(
+        &stack.config.ignore_services,
+        &services,
+        containers,
+      )
+    };
 
     services_with_containers
       .sort_by(|a, b| a.service.cmp(&b.service));
@@ -343,5 +351,83 @@ pub async fn update_server_deployment_cache(
         .into(),
       )
       .await;
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use komodo_client::entities::{
+    docker::container::ContainerStateStatusEnum,
+    stack::resolution::{
+      ComposeResolutionError, ComposeResolutionErrorKind,
+      ComposeResolutionStage, ComposeResolutionState,
+    },
+  };
+
+  #[tokio::test]
+  async fn compose_include_failure_keeps_unknown_stack_state() {
+    let mut stack = Stack::default();
+    stack.id = "compose-include-monitor-failed".into();
+    stack.info.resolution = Some(ComposeResolutionState::Failed {
+      source_identity: None,
+      error: ComposeResolutionError::new(
+        ComposeResolutionErrorKind::UnsupportedCapability,
+        ComposeResolutionStage::Config,
+      ),
+    });
+    let container = ContainerListItem {
+      name: "test-app-1".into(),
+      state: ContainerStateStatusEnum::Running,
+      ..Default::default()
+    };
+
+    update_server_stack_cache(
+      vec![stack.clone()],
+      std::slice::from_ref(&container),
+      &[],
+    )
+    .await;
+    assert_eq!(
+      stack_status_cache()
+        .get(&stack.id)
+        .await
+        .unwrap()
+        .curr
+        .state,
+      StackState::Unknown
+    );
+
+    stack.info.deployed_services = Some(vec![StackServiceNames {
+      service_name: "app".into(),
+      container_name: "test-app".into(),
+      image: "synthetic/app".into(),
+      image_digest: None,
+    }]);
+    update_server_stack_cache(vec![stack.clone()], &[container], &[])
+      .await;
+    assert_eq!(
+      stack_status_cache()
+        .get(&stack.id)
+        .await
+        .unwrap()
+        .curr
+        .state,
+      StackState::Running
+    );
+
+    stack.info.resolution = None;
+    stack.info.deployed_services = None;
+    update_server_stack_cache(vec![stack.clone()], &[], &[]).await;
+    assert_eq!(
+      stack_status_cache()
+        .get(&stack.id)
+        .await
+        .unwrap()
+        .curr
+        .state,
+      StackState::Down
+    );
+    stack_status_cache().remove(&stack.id).await;
   }
 }

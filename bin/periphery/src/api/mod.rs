@@ -27,6 +27,10 @@ mod keys;
 mod poll;
 mod swarm;
 
+pub(crate) use compose::maybe_wrap_command;
+#[cfg(test)]
+pub(crate) use compose::observed_restart;
+
 #[derive(Debug)]
 pub struct Args {
   pub core: String,
@@ -73,6 +77,7 @@ pub enum PeripheryRequest {
   PruneBuildx(PruneBuildx),
 
   // Compose (Read)
+  ResolveComposeStack(ResolveComposeStack),
   GetComposeContentsOnHost(GetComposeContentsOnHost),
   GetComposeLog(GetComposeLog),
   GetComposeLogSearch(GetComposeLogSearch),
@@ -83,6 +88,7 @@ pub enum PeripheryRequest {
   ComposePull(ComposePull),
   ComposeUp(ComposeUp),
   ComposeExecution(ComposeExecution),
+  ComposeRestartObserved(ComposeRestartObserved),
   ComposeRun(ComposeRun),
 
   // Container (Read)

@@ -1,0 +1,2 @@
+include:
+  - oci://compose-include.invalid/never-fetch:synthetic

@@ -3235,6 +3235,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sha2 0.11.0",
  "shell-escape",
  "shlex 2.0.1",
  "strum 0.28.0",
@@ -4308,6 +4309,7 @@ dependencies = [
  "mogh_pki",
  "mogh_resolver",
  "serde",
+ "serde_json",
  "strum 0.28.0",
  "uuid",
 ]

@@ -22,6 +22,15 @@ use crate::{
 
 pub mod write;
 
+mod include;
+mod inline;
+
+#[cfg(test)]
+pub(crate) use include::tests::Fixture;
+
+mod repository;
+pub(crate) mod resolve;
+
 #[instrument(
   "MaybeLoginRegistry",
   skip_all,

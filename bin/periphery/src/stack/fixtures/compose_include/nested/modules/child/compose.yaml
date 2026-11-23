@@ -1,0 +1,3 @@
+services:
+  leaf:
+    image: conformance/leaf:synthetic

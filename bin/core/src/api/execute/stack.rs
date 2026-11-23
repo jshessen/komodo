@@ -1,9 +1,7 @@
-use std::{collections::HashSet, str::FromStr};
+use std::{collections::HashSet, str::FromStr, sync::Arc};
 
 use anyhow::{Context, anyhow};
-use database::mungos::mongodb::bson::{
-  doc, oid::ObjectId, to_bson, to_document,
-};
+use database::mungos::mongodb::bson::{doc, oid::ObjectId, to_bson};
 use formatting::format_serror;
 use interpolate::Interpolator;
 use komodo_client::{
@@ -44,7 +42,8 @@ use crate::{
   resource,
   stack::{
     execute::{
-      execute_compose, execute_compose_with_stack_and_server,
+      RestartObservation, execute_compose,
+      execute_compose_with_stack_and_server,
     },
     setup_stack_execution,
   },
@@ -119,6 +118,18 @@ impl Resolve<ExecuteArgs> for DeployStack {
     .await?;
 
     swarm_or_server.verify_has_target()?;
+    crate::stack::discovery::ensure_companion_capability(&stack)
+      .await?;
+    let refreshed = resource::get::<Stack>(&stack.id).await?;
+    if crate::stack::discovery::generation(&stack, None)?
+      != crate::stack::discovery::generation(&refreshed, None)?
+    {
+      return Err(
+        anyhow!("Stack configuration changed before deployment")
+          .into(),
+      );
+    }
+    stack.info = refreshed.info;
 
     let mut repo = if !stack.config.files_on_host
       && !stack.config.linked_repo.is_empty()
@@ -128,6 +139,18 @@ impl Resolve<ExecuteArgs> for DeployStack {
         .into()
     } else {
       None
+    };
+    let refresh_discovery =
+      crate::stack::discovery::uses_discovery(&stack, repo.as_ref());
+    let stack_id = stack.id.clone();
+    let expected_resolution = match &stack.info.resolution {
+      Some(komodo_client::entities::stack::ComposeResolutionState::Success(accepted))
+        if accepted.source_identity.request_identity.config_generation
+          == crate::stack::discovery::generation(&stack, repo.as_ref())? =>
+      {
+        Some(accepted.clone())
+      }
+      _ => None,
     };
 
     // get the action state for the stack (or insert default).
@@ -188,6 +211,7 @@ impl Resolve<ExecuteArgs> for DeployStack {
     let DeployStackResponse {
       logs,
       deployed,
+      deployed_resolution: observed_deployment,
       services,
       file_contents,
       missing_files,
@@ -220,6 +244,7 @@ impl Resolve<ExecuteArgs> for DeployStack {
             git_token,
             registry_token,
             replacers: secret_replacers.into_iter().collect(),
+            expected_resolution: expected_resolution.clone(),
           })
           .await?
       }
@@ -238,6 +263,11 @@ impl Resolve<ExecuteArgs> for DeployStack {
       // This ensures to get the latest project name,
       // as it may have changed since the last deploy.
       let project_name = stack.project_name(true);
+      let deployed_resolution = deployment_resolution(
+        &stack.info.resolution,
+        expected_resolution.as_ref(),
+        observed_deployment,
+      );
 
       let (
         deployed_services,
@@ -245,6 +275,7 @@ impl Resolve<ExecuteArgs> for DeployStack {
         deployed_config,
         deployed_hash,
         deployed_message,
+        deployed_resolution,
       ) = if deployed {
         (
           Some(latest_services.clone()),
@@ -260,6 +291,7 @@ impl Resolve<ExecuteArgs> for DeployStack {
           merged_config,
           commit_hash.clone(),
           commit_message.clone(),
+          deployed_resolution,
         )
       } else {
         (
@@ -268,6 +300,7 @@ impl Resolve<ExecuteArgs> for DeployStack {
           stack.info.deployed_config,
           stack.info.deployed_hash,
           stack.info.deployed_message,
+          stack.info.deployed_resolution.clone(),
         )
       };
 
@@ -292,9 +325,12 @@ impl Resolve<ExecuteArgs> for DeployStack {
           .then_some(remote_errors),
         latest_hash: commit_hash,
         latest_message: commit_message,
+        resolution: stack.info.resolution,
+        deployed_resolution,
       };
 
-      let info = to_document(&info)
+      let info = info
+        .to_document()
         .context("Failed to serialize stack info to bson")?;
 
       db_client()
@@ -309,13 +345,32 @@ impl Resolve<ExecuteArgs> for DeployStack {
     };
 
     // This will be weird with single service deploys. Come back to it.
-    if let Err(e) = update_info.await {
-      update.push_error_log(
+    match update_info.await {
+      Err(e) => update.push_error_log(
         "Refresh Stack Info",
         format_serror(
           &e.context("Failed to refresh stack info on db").into(),
         ),
-      )
+      ),
+      Ok(()) if refresh_discovery => {
+        if let Err(error) = (RefreshStackCache { stack: stack_id })
+          .resolve(&WriteArgs { user: user.clone() })
+          .await
+        {
+          update.push_error_log(
+            "Refresh Stack Info",
+            format_serror(
+              &error
+                .error
+                .context(
+                  "Deployment finished, but source refresh failed",
+                )
+                .into(),
+            ),
+          );
+        }
+      }
+      Ok(()) => {}
     }
 
     // Ensure cached stack state up to date by updating server cache
@@ -411,28 +466,42 @@ impl Resolve<ExecuteArgs> for DeployStackIfChanged {
 
     let stack = resource::get::<Stack>(&stack.id).await?;
 
-    let action = match (
-      &stack.info.deployed_contents,
-      &stack.info.remote_contents,
-    ) {
-      (Some(deployed_contents), Some(latest_contents)) => {
-        let services = stack
-          .info
-          .latest_services
-          .iter()
-          .map(|s| s.service_name.clone())
-          .collect::<Vec<_>>();
-        resolve_deploy_if_changed_action(
-          deployed_contents,
-          latest_contents,
-          &services,
-        )
+    crate::stack::discovery::ensure_change_comparable(&stack).await?;
+
+    let action = if stack.config.swarm_id.is_empty()
+      && stack.info.resolution.is_some()
+    {
+      let services = stack
+        .info
+        .latest_services
+        .iter()
+        .map(|service| service.service_name.clone())
+        .collect::<Vec<_>>();
+      resolve_discovered_deploy_action(&stack.info, &services)?
+    } else {
+      match (
+        &stack.info.deployed_contents,
+        &stack.info.remote_contents,
+      ) {
+        (Some(deployed_contents), Some(latest_contents)) => {
+          let services = stack
+            .info
+            .latest_services
+            .iter()
+            .map(|s| s.service_name.clone())
+            .collect::<Vec<_>>();
+          resolve_deploy_if_changed_action(
+            deployed_contents,
+            latest_contents,
+            &services,
+          )
+        }
+        (None, _) => DeployIfChangedAction::FullDeploy,
+        _ => DeployIfChangedAction::Services {
+          deploy: Vec::new(),
+          restart: Vec::new(),
+        },
       }
-      (None, _) => DeployIfChangedAction::FullDeploy,
-      _ => DeployIfChangedAction::Services {
-        deploy: Vec::new(),
-        restart: Vec::new(),
-      },
     };
 
     let mut update = update.clone();
@@ -462,15 +531,17 @@ impl Resolve<ExecuteArgs> for DeployStackIfChanged {
         // host before restart.
         maybe_pull_stack(&stack, Some(&mut update)).await?;
 
-        let mut update =
-          restart_services(stack.name, Vec::new(), user).await?;
-
+        let (mut update, observed) =
+          restart_services_observed(&stack, Vec::new(), user).await?;
         if update.success {
           // Need to update 'info.deployed_contents' with the
           // latest contents so next check doesn't read the same diff.
           update_deployed_contents_with_latest(
             &stack.id,
             stack.info.remote_contents,
+            stack.info.deployed_resolution,
+            stack.info.resolution,
+            observed,
             &mut update,
           )
           .await;
@@ -498,8 +569,9 @@ impl Resolve<ExecuteArgs> for DeployStackIfChanged {
             // host before restart. Only necessary if no "deploys" (deploy already pulls stack).
             maybe_pull_stack(&stack, Some(&mut update)).await?;
 
-            let mut update =
-              restart_services(stack.name, restart, user).await?;
+            let (mut update, observed) =
+              restart_services_observed(&stack, restart, user)
+                .await?;
 
             if update.success {
               // Need to update 'info.deployed_contents' with the
@@ -507,6 +579,9 @@ impl Resolve<ExecuteArgs> for DeployStackIfChanged {
               update_deployed_contents_with_latest(
                 &stack.id,
                 stack.info.remote_contents,
+                stack.info.deployed_resolution,
+                stack.info.resolution,
+                observed,
                 &mut update,
               )
               .await;
@@ -627,6 +702,71 @@ async fn restart_services(
     .await
 }
 
+async fn restart_services_observed(
+  stack: &Stack,
+  services: Vec<String>,
+  user: &User,
+) -> mogh_error::Result<(
+  Update,
+  Option<komodo_client::entities::stack::AcceptedComposeResolution>,
+)> {
+  use komodo_client::entities::stack::ComposeResolutionState;
+  let Some(ComposeResolutionState::Success(expected)) =
+    &stack.info.resolution
+  else {
+    return Ok((
+      restart_services(stack.name.clone(), services, user).await?,
+      None,
+    ));
+  };
+  let mut source = stack.clone();
+  let mut repo = if !source.config.files_on_host
+    && !source.config.linked_repo.is_empty()
+  {
+    Some(resource::get::<Repo>(&source.config.linked_repo).await?)
+  } else {
+    None
+  };
+  let replacers = if !source.config.skip_secret_interp {
+    let VariablesAndSecrets { variables, secrets } =
+      get_variables_and_secrets().await?;
+    let mut interpolator =
+      Interpolator::new(Some(&variables), &secrets);
+    interpolator.interpolate_stack(&mut source)?;
+    if let Some(repo) = repo.as_mut()
+      && !repo.config.skip_secret_interp
+    {
+      interpolator.interpolate_repo(repo)?;
+    }
+    interpolator.secret_replacers
+  } else {
+    Default::default()
+  };
+  let result = Arc::new(tokio::sync::Mutex::new(None));
+  let req = ExecuteRequest::RestartStack(RestartStack {
+    stack: stack.name.clone(),
+    services: services.clone(),
+  });
+  let update = init_execution_update(&req, user).await?;
+  let update = execute_compose::<RestartStack>(
+    &stack.id,
+    services,
+    user,
+    |state| state.restarting = true,
+    update,
+    Some(RestartObservation {
+      stack: source,
+      repo,
+      expected: expected.clone(),
+      replacers: replacers.into_iter().collect(),
+      result: result.clone(),
+    }),
+  )
+  .await?;
+  let observed = result.lock().await.take();
+  Ok((update, observed))
+}
+
 /// This can safely be called in [DeployStackIfChanged]
 /// when there are ONLY changes to config files requiring restart,
 /// AFTER the restart has been successfully completed.
@@ -647,31 +787,78 @@ async fn restart_services(
 async fn update_deployed_contents_with_latest(
   id: &str,
   contents: Option<Vec<StackRemoteFileContents>>,
+  deployed_resolution: Option<
+    komodo_client::entities::stack::AcceptedComposeResolution,
+  >,
+  resolution: Option<
+    komodo_client::entities::stack::ComposeResolutionState,
+  >,
+  observed: Option<
+    komodo_client::entities::stack::AcceptedComposeResolution,
+  >,
   update: &mut Update,
 ) {
-  let Some(contents) = contents else {
-    return;
-  };
-  let contents = contents
-    .into_iter()
-    .map(|f| FileContents {
-      path: f.path,
-      contents: f.contents,
-    })
-    .collect::<Vec<_>>();
   if let Err(e) = (async {
-    let contents = to_bson(&contents)
-      .context("Failed to serialize contents to bson")?;
+    let mut fields = database::bson::Document::new();
+    if let Some(contents) = contents {
+      let contents = contents
+        .into_iter()
+        .map(|f| FileContents {
+          path: f.path,
+          contents: f.contents,
+        })
+        .collect::<Vec<_>>();
+      fields.insert(
+        "info.deployed_contents",
+        to_bson(&contents)
+          .context("Failed to serialize contents to bson")?,
+      );
+    }
+    let mut filter = doc! {};
+    if let Some(deployed) = deployed_resolution {
+      filter.insert(
+        "info.deployed_resolution",
+        to_bson(&deployed)
+          .context("Failed to serialize deployed source evidence")?,
+      );
+      let (deployed, verified) =
+        restart_resolution(deployed, resolution.as_ref(), observed);
+      if verified {
+        filter.insert(
+          "info.resolution",
+          to_bson(&resolution)
+            .context("Failed to serialize current source evidence")?,
+        );
+      } else {
+        update.push_simple_log(
+          "Compose source tracking",
+          "Restart succeeded, but its source snapshot could not be verified. Automatic source-change comparisons are unavailable until a verified deployment.",
+        );
+      }
+      fields.insert(
+        "info.deployed_resolution",
+        to_bson(&deployed)
+          .context("Failed to serialize deployed source evidence")?,
+      );
+    }
+    if fields.is_empty() {
+      return Ok(());
+    }
     let id =
       ObjectId::from_str(id).context("Id is not valid ObjectId")?;
-    db_client()
+    filter.insert("_id", id);
+    let result = db_client()
       .stacks
       .update_one(
-        doc! { "_id": id },
-        doc! { "$set": { "info.deployed_contents": contents } },
+        filter,
+        doc! { "$set": fields },
       )
       .await
       .context("Failed to update stack 'deployed_contents'")?;
+    anyhow::ensure!(
+      result.matched_count == 1,
+      "Stack source evidence changed before restart state could be recorded"
+    );
     anyhow::Ok(())
   })
   .await
@@ -682,7 +869,39 @@ async fn update_deployed_contents_with_latest(
     );
     update.finalize();
     let _ = update_update(update.clone()).await;
+  } else if let Err(error) = update_update(update.clone()).await {
+    warn!(%error, "Failed to persist restart source tracking status");
+    update.push_error_log(
+      "Update content cache",
+      "Failed to persist restart source tracking status",
+    );
+    update.finalize();
   }
+}
+
+fn restart_resolution(
+  mut deployed: komodo_client::entities::stack::AcceptedComposeResolution,
+  current: Option<
+    &komodo_client::entities::stack::ComposeResolutionState,
+  >,
+  observed: Option<
+    komodo_client::entities::stack::AcceptedComposeResolution,
+  >,
+) -> (
+  komodo_client::entities::stack::AcceptedComposeResolution,
+  bool,
+) {
+  use komodo_client::entities::stack::ComposeResolutionState;
+  if let (
+    Some(ComposeResolutionState::Success(expected)),
+    Some(observed),
+  ) = (current, observed)
+    && &observed == expected
+  {
+    return (observed, true);
+  }
+  deployed.source_identity.observed_snapshot.complete = false;
+  (deployed, false)
 }
 
 enum DeployIfChangedAction {
@@ -704,15 +923,403 @@ enum DeployIfChangedAction {
   },
 }
 
+fn deployment_resolution(
+  resolution: &Option<
+    komodo_client::entities::stack::ComposeResolutionState,
+  >,
+  expected: Option<
+    &komodo_client::entities::stack::AcceptedComposeResolution,
+  >,
+  observed: Option<
+    komodo_client::entities::stack::AcceptedComposeResolution,
+  >,
+) -> Option<komodo_client::entities::stack::AcceptedComposeResolution>
+{
+  use komodo_client::entities::stack::ComposeResolutionSource;
+  let Some(
+    komodo_client::entities::stack::ComposeResolutionState::Success(
+      accepted,
+    ),
+  ) = resolution
+  else {
+    return None;
+  };
+  if let (Some(expected), Some(observed)) = (expected, observed) {
+    let mut identity =
+      expected.source_identity.request_identity.clone();
+    if let (
+      ComposeResolutionSource::Repository { commit_id, .. },
+      ComposeResolutionSource::Repository {
+        commit_id: actual, ..
+      },
+    ) = (
+      &mut identity.source,
+      &observed.source_identity.request_identity.source,
+    ) {
+      *commit_id = actual.clone();
+    }
+    if expected == accepted
+      && identity == observed.source_identity.request_identity
+      && observed.source_identity.observed_snapshot.complete
+      && observed
+        .source_identity
+        .observed_snapshot
+        .validate(&identity, &observed.dependencies)
+        .is_ok()
+    {
+      return Some(observed);
+    }
+    warn!("Rejected invalid deployed Compose source evidence");
+  }
+  let mut deployed = accepted.clone();
+  deployed.source_identity.observed_snapshot.complete = false;
+  Some(deployed)
+}
+
+#[cfg(test)]
+mod compose_diff_tests {
+  use super::*;
+  use komodo_client::entities::stack::{
+    AcceptedComposeResolution, ComposeResolutionSource,
+    ComposeResolutionState, ComposeSourceIdentity,
+    DerivedComposeDependency, ObservedComposeSnapshot,
+    ResolutionRequestIdentity,
+  };
+
+  fn dependency(path: &str, kind: &str) -> DerivedComposeDependency {
+    serde_json::from_value(serde_json::json!({
+      "path":path,"kind":kind,"project_directory":".","fingerprint":"a".repeat(64),
+    })).unwrap()
+  }
+
+  fn accepted(
+    dependencies: Vec<DerivedComposeDependency>,
+  ) -> AcceptedComposeResolution {
+    AcceptedComposeResolution {
+      source_identity: ComposeSourceIdentity {
+        request_identity: ResolutionRequestIdentity {
+          stack_id: "stack-id".into(),
+          config_generation: "generation".into(),
+          source: ComposeResolutionSource::Host {
+            server_id: "server".into(),
+            run_directory: ".".into(),
+          },
+        },
+        observed_snapshot: ObservedComposeSnapshot {
+          complete: true,
+          dependency_fingerprints: dependencies
+            .iter()
+            .map(DerivedComposeDependency::observed_fingerprint)
+            .collect(),
+          commit_id: None,
+          config_generation: None,
+        },
+      },
+      dependencies,
+    }
+  }
+
+  fn info(
+    latest: Vec<DerivedComposeDependency>,
+    deployed: Vec<DerivedComposeDependency>,
+  ) -> StackInfo {
+    StackInfo {
+      resolution: Some(ComposeResolutionState::Success(accepted(
+        latest,
+      ))),
+      deployed_resolution: Some(accepted(deployed)),
+      ..Default::default()
+    }
+  }
+
+  #[test]
+  fn compose_include_diff_detects_include_edit_add_remove_and_private_environment_changes()
+  -> anyhow::Result<()> {
+    let original = vec![
+      dependency("compose.yaml", "compose"),
+      dependency("modules/child.yaml", "compose"),
+      dependency(".env", "environment"),
+    ];
+    for changed in [1, 2] {
+      let mut latest = original.clone();
+      latest[changed].fingerprint = "b".repeat(64);
+      assert!(matches!(
+        resolve_discovered_deploy_action(
+          &info(latest, original.clone()),
+          &[]
+        )?,
+        DeployIfChangedAction::FullDeploy
+      ));
+    }
+    let mut added = original.clone();
+    added.push(dependency("modules/nested.yaml", "compose"));
+    assert!(matches!(
+      resolve_discovered_deploy_action(
+        &info(added, original.clone()),
+        &[]
+      )?,
+      DeployIfChangedAction::FullDeploy
+    ));
+    let mut removed = original.clone();
+    removed.remove(1);
+    assert!(matches!(
+      resolve_discovered_deploy_action(
+        &info(removed, original.clone()),
+        &[]
+      )?,
+      DeployIfChangedAction::FullDeploy
+    ));
+    assert!(
+      matches!(resolve_discovered_deploy_action(&info(original.clone(),original), &[])?, DeployIfChangedAction::Services { deploy, restart } if deploy.is_empty() && restart.is_empty())
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn compose_include_diff_preserves_auxiliary_policies_and_accepts_matching_snapshots()
+  -> anyhow::Result<()> {
+    let mut auxiliary = dependency("settings.conf", "auxiliary");
+    auxiliary.requires = StackFileRequires::Restart;
+    auxiliary.services = vec!["app".into()];
+    let deployed =
+      vec![dependency("compose.yaml", "compose"), auxiliary];
+    let mut latest = deployed.clone();
+    latest[1].fingerprint = "b".repeat(64);
+    let mut state = info(latest.clone(), deployed);
+    assert!(
+      matches!(resolve_discovered_deploy_action(&state, &["app".into()])?, DeployIfChangedAction::Services {deploy, restart} if deploy.is_empty() && restart == ["app"])
+    );
+    state.deployed_resolution = Some(accepted(latest));
+    assert!(
+      matches!(resolve_discovered_deploy_action(&state, &[])?, DeployIfChangedAction::Services {deploy, restart} if deploy.is_empty() && restart.is_empty())
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn compose_include_diff_rejects_incomplete_source_evidence() {
+    let dependencies = vec![dependency("compose.yaml", "compose")];
+    let mut state = info(dependencies.clone(), dependencies);
+    if let Some(ComposeResolutionState::Success(latest)) =
+      &mut state.resolution
+    {
+      latest.source_identity.observed_snapshot.complete = false;
+    }
+    assert!(resolve_discovered_deploy_action(&state, &[]).is_err());
+    if let Some(ComposeResolutionState::Success(latest)) =
+      &mut state.resolution
+    {
+      latest.source_identity.observed_snapshot.complete = true;
+    }
+    state
+      .deployed_resolution
+      .as_mut()
+      .unwrap()
+      .source_identity
+      .observed_snapshot
+      .complete = false;
+    assert!(resolve_discovered_deploy_action(&state, &[]).is_err());
+  }
+
+  #[test]
+  fn compose_include_restart_tracks_only_observed_sources()
+  -> anyhow::Result<()> {
+    let mut auxiliary = dependency("settings.conf", "auxiliary");
+    auxiliary.requires = StackFileRequires::Restart;
+    let old = vec![dependency("compose.yaml", "compose"), auxiliary];
+    let mut latest = old.clone();
+    latest[1].fingerprint = "b".repeat(64);
+    let mut state = info(latest.clone(), old.clone());
+    let (observed, verified) = restart_resolution(
+      accepted(old.clone()),
+      state.resolution.as_ref(),
+      Some(accepted(latest.clone())),
+    );
+    assert!(verified);
+    state.deployed_resolution = Some(observed);
+    assert!(matches!(
+      resolve_discovered_deploy_action(&state, &[])?,
+      DeployIfChangedAction::Services { deploy, restart }
+        if deploy.is_empty() && restart.is_empty()
+    ));
+    let (unverified, verified) = restart_resolution(
+      accepted(old),
+      state.resolution.as_ref(),
+      None,
+    );
+    assert!(!verified);
+    state.deployed_resolution = Some(unverified);
+    assert!(resolve_discovered_deploy_action(&state, &[]).is_err());
+    Ok(())
+  }
+
+  #[test]
+  fn compose_include_deployment_requires_verified_sources()
+  -> anyhow::Result<()> {
+    let dependencies = vec![dependency("compose.yaml", "compose")];
+    let mut state = info(dependencies.clone(), dependencies);
+    let Some(ComposeResolutionState::Success(expected)) =
+      state.resolution.clone()
+    else {
+      unreachable!()
+    };
+    state.deployed_resolution =
+      deployment_resolution(&state.resolution, Some(&expected), None);
+    assert!(resolve_discovered_deploy_action(&state, &[]).is_err());
+
+    let mut changed = expected.dependencies.clone();
+    changed[0].fingerprint = "b".repeat(64);
+    let observed = accepted(changed.clone());
+    state.deployed_resolution = deployment_resolution(
+      &state.resolution,
+      Some(&expected),
+      Some(observed.clone()),
+    );
+    assert!(matches!(
+      resolve_discovered_deploy_action(&state, &[])?,
+      DeployIfChangedAction::FullDeploy
+    ));
+    state.resolution =
+      Some(ComposeResolutionState::Success(observed.clone()));
+    assert!(matches!(
+      resolve_discovered_deploy_action(&state, &[])?,
+      DeployIfChangedAction::Services { deploy, restart }
+        if deploy.is_empty() && restart.is_empty()
+    ));
+
+    let mut invalid = observed.clone();
+    invalid.source_identity.observed_snapshot.complete = false;
+    let deployed = deployment_resolution(
+      &state.resolution,
+      Some(&observed),
+      Some(invalid),
+    )
+    .unwrap();
+    assert!(!deployed.source_identity.observed_snapshot.complete);
+    Ok(())
+  }
+
+  #[test]
+  fn compose_include_deployment_accepts_only_matching_source_context()
+  -> anyhow::Result<()> {
+    let mut expected =
+      accepted(vec![dependency("compose.yaml", "compose")]);
+    expected.source_identity.request_identity.source =
+      ComposeResolutionSource::Repository {
+        provider: "example.invalid".into(),
+        repository: "synthetic/repo".into(),
+        run_directory: ".".into(),
+        commit_id: "a".repeat(40),
+      };
+    expected.source_identity.observed_snapshot.commit_id =
+      Some("a".repeat(40));
+    let resolution =
+      Some(ComposeResolutionState::Success(expected.clone()));
+    let mut observed = expected.clone();
+    if let ComposeResolutionSource::Repository { commit_id, .. } =
+      &mut observed.source_identity.request_identity.source
+    {
+      *commit_id = "b".repeat(40);
+    }
+    observed.source_identity.observed_snapshot.commit_id =
+      Some("b".repeat(40));
+    assert!(
+      deployment_resolution(
+        &resolution,
+        Some(&expected),
+        Some(observed.clone()),
+      )
+      .unwrap()
+        == observed
+    );
+    if let ComposeResolutionSource::Repository {
+      repository, ..
+    } = &mut observed.source_identity.request_identity.source
+    {
+      *repository = "other/repo".into();
+    }
+    assert!(
+      !deployment_resolution(
+        &resolution,
+        Some(&expected),
+        Some(observed),
+      )
+      .unwrap()
+      .source_identity
+      .observed_snapshot
+      .complete
+    );
+    Ok(())
+  }
+}
+
+fn resolve_discovered_deploy_action(
+  info: &StackInfo,
+  all_services: &[String],
+) -> anyhow::Result<DeployIfChangedAction> {
+  use komodo_client::entities::stack::{
+    ComposeResolutionState, DerivedComposeDependency,
+  };
+  let Some(ComposeResolutionState::Success(latest)) =
+    &info.resolution
+  else {
+    anyhow::bail!(
+      "A successful current Compose resolution is required before comparing sources"
+    );
+  };
+  anyhow::ensure!(
+    latest.source_identity.observed_snapshot.complete,
+    "Compose includes untracked remote sources; automatic change decisions are unavailable"
+  );
+  latest.source_identity.observed_snapshot.validate(
+    &latest.source_identity.request_identity,
+    &latest.dependencies,
+  )?;
+  let Some(deployed) = &info.deployed_resolution else {
+    return Ok(DeployIfChangedAction::FullDeploy);
+  };
+  anyhow::ensure!(
+    deployed.source_identity.observed_snapshot.complete,
+    "Deployed Compose source snapshot is incomplete; cannot compare changes"
+  );
+  deployed.source_identity.observed_snapshot.validate(
+    &deployed.source_identity.request_identity,
+    &deployed.dependencies,
+  )?;
+  let same_input =
+    |left: &DerivedComposeDependency,
+     right: &DerivedComposeDependency| {
+      left.path == right.path
+        && left.kind == right.kind
+        && left.project_directory == right.project_directory
+    };
+  let changed = latest.dependencies.iter().filter(|latest| {
+    deployed
+      .dependencies
+      .iter()
+      .find(|old| same_input(latest, old))
+      .is_none_or(|old| old.fingerprint != latest.fingerprint)
+  });
+  let removed = deployed.dependencies.iter().filter(|old| {
+    !latest
+      .dependencies
+      .iter()
+      .any(|latest| same_input(latest, old))
+  });
+  Ok(resolve_changed_file_policies(
+    changed
+      .chain(removed)
+      .map(|file| (file.requires, file.services.as_slice())),
+    all_services,
+  ))
+}
+
 fn resolve_deploy_if_changed_action(
   deployed_contents: &[FileContents],
   latest_contents: &[StackRemoteFileContents],
   all_services: &[String],
 ) -> DeployIfChangedAction {
-  let mut full_restart = false;
-  let mut deploy = HashSet::<String>::new();
-  let mut restart = HashSet::<String>::new();
-
+  let mut changed = Vec::new();
   for latest in latest_contents {
     let Some(deployed) =
       deployed_contents.iter().find(|c| c.path == latest.path)
@@ -725,7 +1332,20 @@ fn resolve_deploy_if_changed_action(
     if latest.contents == deployed.contents {
       continue;
     }
-    match (latest.requires, latest.services.is_empty()) {
+    changed.push((latest.requires, latest.services.as_slice()));
+  }
+  resolve_changed_file_policies(changed.into_iter(), all_services)
+}
+
+fn resolve_changed_file_policies<'a>(
+  changed: impl Iterator<Item = (StackFileRequires, &'a [String])>,
+  all_services: &[String],
+) -> DeployIfChangedAction {
+  let mut full_restart = false;
+  let mut deploy = HashSet::<String>::new();
+  let mut restart = HashSet::<String>::new();
+  for (requires, services) in changed {
+    match (requires, services.is_empty()) {
       (StackFileRequires::Redeploy, true) => {
         // File has requires = "Redeploy" at global level.
         // Can do early return here.
@@ -733,14 +1353,14 @@ fn resolve_deploy_if_changed_action(
       }
       (StackFileRequires::Redeploy, false) => {
         // Requires redeploy on specific services
-        deploy.extend(latest.services.clone());
+        deploy.extend(services.iter().cloned());
       }
       (StackFileRequires::Restart, true) => {
         // Services empty -> Full restart
         full_restart = true;
       }
       (StackFileRequires::Restart, false) => {
-        restart.extend(latest.services.clone());
+        restart.extend(services.iter().cloned());
       }
       (StackFileRequires::None, _) => {
         // File can be ignored even with changes.
@@ -846,6 +1466,8 @@ pub async fn pull_stack_inner(
   mut repo: Option<Repo>,
   mut update: Option<&mut Update>,
 ) -> anyhow::Result<ComposePullResponse> {
+  crate::stack::discovery::ensure_companion_capability(&stack)
+    .await?;
   if let Some(update) = update.as_mut()
     && !services.is_empty()
   {
@@ -1047,7 +1669,7 @@ impl Resolve<ExecuteArgs> for RestartStack {
         state.restarting = true;
       },
       update.clone(),
-      (),
+      None,
     )
     .await
     .map_err(Into::into)
@@ -1330,6 +1952,8 @@ impl Resolve<ExecuteArgs> for RunStackService {
       );
     };
 
+    crate::stack::discovery::ensure_companion_capability(&stack)
+      .await?;
     let mut repo = if !stack.config.files_on_host
       && !stack.config.linked_repo.is_empty()
     {
