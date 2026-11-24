@@ -5,7 +5,9 @@ use axum::{
   Extension, Router, extract::Path, middleware, routing::post,
 };
 use axum_extra::{TypedHeader, headers::ContentType};
-use database::mungos::by_id::find_one_by_id;
+use database::mungos::{
+  by_id::find_one_by_id, mongodb::bson::oid::ObjectId,
+};
 use formatting::format_serror;
 use futures_util::future::join_all;
 use komodo_client::{
@@ -32,7 +34,7 @@ use crate::{
   auth::KomodoAuthImpl,
   helpers::{
     query::get_all_tags,
-    update::{init_execution_update, update_update},
+    update::{add_update, init_execution_update, update_update},
   },
   resource::{KomodoResource, list_full_for_user_using_pattern},
   state::db_client,
@@ -246,13 +248,21 @@ pub fn inner_handler(
 
     // Spawn a task for the execution which continues
     // running after this method returns.
+    let mut task_update = update.clone();
+    let deferred_update = task_update.id.is_empty();
+    if deferred_update {
+      // Reserve an ID without creating a no-op update; deployments can
+      // subsequently persist it and the failure monitor can find it.
+      task_update.id = ObjectId::new().to_string();
+    }
     let handle =
-      tokio::spawn(task(task_id, request, user, update.clone()));
+      tokio::spawn(task(task_id, request, user, task_update.clone()));
 
     // Spawns another task to monitor the first for failures,
     // and add the log to Update about it (which primary task can't do because it errored out)
     tokio::spawn({
-      let update_id = update.id.clone();
+      let update_id = task_update.id.clone();
+      let initial_update = task_update;
       async move {
         let log = match handle.await {
           Ok(Err(e)) => {
@@ -274,16 +284,21 @@ pub fn inner_handler(
           _ => return,
         };
         let res = async {
-          // Nothing to do if update was never actually created,
-          // which is the case when the id is empty.
-          if update_id.is_empty() {
-            return Ok(());
-          }
-          let mut update =
+          let existing =
             find_one_by_id(&db_client().updates, &update_id)
               .await
-              .context("Failed to query to db")?
-              .context("No Update exists with given id")?;
+              .context("Failed to query to db")?;
+          let mut update = match existing {
+            Some(update) => update,
+            None if deferred_update => {
+              let mut update = initial_update;
+              update.logs.push(log);
+              update.finalize();
+              add_update(update).await?;
+              return Ok(());
+            }
+            None => anyhow::bail!("No Update exists with given id"),
+          };
           update.logs.push(log);
           update.finalize();
           update_update(update).await
