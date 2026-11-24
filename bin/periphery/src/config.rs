@@ -13,7 +13,16 @@ use mogh_secret_file::{
 
 pub fn periphery_args() -> &'static CliArgs {
   static PERIPHERY_ARGS: OnceLock<CliArgs> = OnceLock::new();
-  PERIPHERY_ARGS.get_or_init(CliArgs::parse)
+  PERIPHERY_ARGS.get_or_init(|| {
+    #[cfg(test)]
+    {
+      CliArgs::parse_from(["periphery"])
+    }
+    #[cfg(not(test))]
+    {
+      CliArgs::parse()
+    }
+  })
 }
 
 pub fn periphery_config() -> &'static PeripheryConfig {

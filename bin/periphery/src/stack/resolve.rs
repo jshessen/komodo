@@ -386,9 +386,6 @@ pub(crate) fn deployment_snapshot(
 ) -> anyhow::Result<
   Option<komodo_client::entities::stack::AcceptedComposeResolution>,
 > {
-  use komodo_client::entities::stack::{
-    AcceptedComposeResolution, ComposeSourceIdentity,
-  };
   let identity = &expected.source_identity;
   if identity.request_identity.stack_id != stack.id
     || identity
@@ -419,6 +416,111 @@ pub(crate) fn deployment_snapshot(
     &stack.all_file_dependencies(),
     None,
   )?;
+  deployment_snapshot_from_graph(
+    stack, directory, env_files, expected, replacers, revision, graph,
+  )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct DeploymentCapture {
+  pub(crate) compose: super::snapshot::CapturedCompose,
+  pub(crate) environment: BTreeMap<String, String>,
+  pub(crate) evidence:
+    komodo_client::entities::stack::AcceptedComposeResolution,
+}
+
+#[cfg(target_os = "linux")]
+fn capture_deployment(
+  stack: &komodo_client::entities::stack::Stack,
+  directory: &Path,
+  env_files: &[String],
+  expected: &komodo_client::entities::stack::AcceptedComposeResolution,
+  replacers: &[(String, String)],
+  revision: Option<&str>,
+  environment: BTreeMap<String, String>,
+) -> anyhow::Result<Option<DeploymentCapture>> {
+  let (_, includes) = super::include::inspect_roots(
+    directory,
+    stack.compose_file_paths(),
+    None,
+  )?;
+  let graph = super::include::inspect(
+    directory,
+    stack.compose_file_paths(),
+    env_files,
+    environment.clone(),
+  )?;
+  if !includes && !graph.root_env_files.is_empty() {
+    return Ok(None);
+  }
+  let graph = super::include::with_files(
+    graph,
+    directory,
+    &stack.all_file_dependencies(),
+    None,
+  )?;
+  super::snapshot::validate_deployment_graph(&graph)?;
+  let compose = super::snapshot::CapturedCompose::from_graph(&graph)?;
+  anyhow::ensure!(
+    compose.project_directory.to_str().is_some(),
+    "Compose project directory is not UTF-8"
+  );
+  let Some(evidence) = deployment_snapshot_from_graph(
+    stack, directory, env_files, expected, replacers, revision, graph,
+  )?
+  else {
+    return Ok(None);
+  };
+  Ok(Some(DeploymentCapture {
+    compose,
+    environment,
+    evidence,
+  }))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn capture_current_deployment(
+  stack: &komodo_client::entities::stack::Stack,
+  directory: &Path,
+  env_files: &[String],
+  expected: &komodo_client::entities::stack::AcceptedComposeResolution,
+  replacers: &[(String, String)],
+  revision: Option<&str>,
+) -> anyhow::Result<Option<DeploymentCapture>> {
+  capture_deployment(
+    stack,
+    directory,
+    env_files,
+    expected,
+    replacers,
+    revision,
+    effective_environment()?,
+  )
+}
+
+fn deployment_snapshot_from_graph(
+  stack: &komodo_client::entities::stack::Stack,
+  directory: &Path,
+  env_files: &[String],
+  expected: &komodo_client::entities::stack::AcceptedComposeResolution,
+  replacers: &[(String, String)],
+  revision: Option<&str>,
+  graph: Graph,
+) -> anyhow::Result<
+  Option<komodo_client::entities::stack::AcceptedComposeResolution>,
+> {
+  use komodo_client::entities::stack::{
+    AcceptedComposeResolution, ComposeSourceIdentity,
+  };
+  let identity = &expected.source_identity;
+  if identity.request_identity.stack_id != stack.id
+    || identity
+      .observed_snapshot
+      .validate(&identity.request_identity, &expected.dependencies)
+      .is_err()
+  {
+    return Ok(None);
+  }
   if graph.has_untracked_remote {
     return Ok(None);
   }
@@ -499,6 +601,7 @@ pub(crate) fn deployment_snapshot(
   };
   observed_snapshot.validate(&request_identity, &dependencies)?;
   Ok(Some(AcceptedComposeResolution {
+    deployment_proven: false,
     source_identity: ComposeSourceIdentity {
       request_identity,
       observed_snapshot,
@@ -1494,22 +1597,23 @@ mod tests {
   }
 
   fn host_request(fixture: &Fixture) -> ResolveComposeStack {
+    host_request_at(&fixture.root)
+  }
+
+  fn host_request_at(root: &Path) -> ResolveComposeStack {
     let mut stack = komodo_client::entities::stack::Stack::default();
     stack.id = "a".repeat(24);
     stack.name = "host-discovery".into();
     stack.config.files_on_host = true;
     stack.config.server_id = "synthetic-server".into();
-    stack.config.run_directory =
-      fixture.root.to_str().unwrap().into();
+    stack.config.run_directory = root.to_str().unwrap().into();
     stack.config.environment = "IMAGE=not-yet-deployed".into();
     stack.config.pre_deploy.command = format!(
       "touch {} && [[UNUSED_HOOK_SECRET]]",
-      fixture.root.join("pre-deploy-ran").display()
+      root.join("pre-deploy-ran").display()
     );
-    stack.config.post_deploy.command = format!(
-      "touch {}",
-      fixture.root.join("post-deploy-ran").display()
-    );
+    stack.config.post_deploy.command =
+      format!("touch {}", root.join("post-deploy-ran").display());
     ResolveComposeStack {
       request_identity: ResolutionRequestIdentity {
         stack_id: stack.id.clone(),
@@ -1611,6 +1715,7 @@ mod tests {
     };
     let expected =
       komodo_client::entities::stack::AcceptedComposeResolution {
+        deployment_proven: false,
         source_identity:
           komodo_client::entities::stack::ComposeSourceIdentity {
             request_identity,
@@ -1629,6 +1734,23 @@ mod tests {
     )?
     .unwrap();
     assert!(first == expected);
+    let captured = super::super::include::inspect(
+      &directory,
+      stack.compose_file_paths(),
+      &[],
+      BTreeMap::new(),
+    )?;
+    #[cfg(target_os = "linux")]
+    let staged = capture_deployment(
+      &stack,
+      &directory,
+      &[],
+      &expected,
+      &[],
+      None,
+      BTreeMap::new(),
+    )?
+    .expect("capture should be supported");
     let child = fixture.root.join("modules/compose.yaml");
     let original = fs::read_to_string(&child)?;
     fs::write(
@@ -1645,6 +1767,41 @@ mod tests {
     )?
     .unwrap();
     assert!(changed != first);
+    let captured_evidence = deployment_snapshot_from_graph(
+      &stack,
+      &directory,
+      &[],
+      &expected,
+      &[],
+      None,
+      captured,
+    )?
+    .unwrap();
+    assert!(captured_evidence == first);
+    assert!(!captured_evidence.deployment_proven);
+    #[cfg(target_os = "linux")]
+    {
+      assert!(staged.evidence == first);
+      let staged_root: serde_yaml_ng::Value =
+        serde_yaml_ng::from_slice(&fs::read(
+          &staged.compose.roots[0],
+        )?)?;
+      let staged_child = staged_root["include"][0]["path"][0]
+        .as_str()
+        .expect("staged child");
+      let staged_text = fs::read_to_string(staged_child)?;
+      assert_eq!(
+        serde_yaml_ng::from_str::<serde_yaml_ng::Value>(
+          &staged_text
+        )?["services"]["module"]["image"],
+        "conformance/module:synthetic"
+      );
+      assert_capture_cancels_with_dropped_caller(
+        staged,
+        &fixture.root,
+      )
+      .await?;
+    }
     assert!(
       deployment_snapshot(
         &stack,
@@ -1752,6 +1909,799 @@ mod tests {
     .await;
     assert!(response.log.success);
     assert!(response.observed_resolution.is_none());
+
+    fs::write(&child, &original)?;
+    let source = stack.clone();
+    let root = directory.clone();
+    let baseline = expected.clone();
+    let changed_child = child.clone();
+    let restored_contents = original.clone();
+    let response = crate::api::observed_restart(
+      &expected,
+      move || {
+        let source = source.clone();
+        let root = root.clone();
+        let baseline = baseline.clone();
+        async move {
+          deployment_snapshot(
+            &source,
+            &root,
+            &[],
+            &baseline,
+            &[],
+            None,
+          )
+          .expect("snapshot must succeed")
+        }
+      },
+      move || async move {
+        fs::write(&changed_child, "# transient source\n").unwrap();
+        fs::write(&changed_child, restored_contents).unwrap();
+        Log::simple("restart", "ok".into())
+      },
+    )
+    .await;
+    assert!(response.log.success);
+    assert!(response.observed_resolution.is_none());
+    Ok(())
+  }
+
+  #[cfg(target_os = "linux")]
+  async fn assert_capture_cancels_with_dropped_caller(
+    capture: DeploymentCapture,
+    directory: &Path,
+  ) -> anyhow::Result<()> {
+    use anyhow::ensure;
+    use shell_escape::unix::escape;
+    use std::sync::Arc;
+
+    let ready = directory.join("capture-ready");
+    let child_pid = directory.join("capture-child-pid");
+    let done = directory.join("capture-done");
+    let script = format!(
+      "/bin/sleep 30 & echo $! > {}; /usr/bin/touch {}; wait; /usr/bin/touch {}",
+      escape(child_pid.to_string_lossy()),
+      escape(ready.to_string_lossy()),
+      escape(done.to_string_lossy()),
+    );
+    let command = format!("/bin/sh -c {}", escape(script.into()));
+    let capture = Arc::new(capture);
+    let weak = Arc::downgrade(&capture);
+    let directory = directory.to_path_buf();
+    let caller = tokio::spawn(crate::api::run_captured_command(
+      "Capture lifetime test",
+      command,
+      directory,
+      capture.clone(),
+    ));
+    drop(capture);
+    tokio::time::timeout(Duration::from_secs(5), async {
+      while !ready.exists() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+      }
+    })
+    .await?;
+    caller.abort();
+    let _ = caller.await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+      while weak.upgrade().is_some() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+      }
+    })
+    .await?;
+    let pid: u32 = fs::read_to_string(child_pid)?.trim().parse()?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+      loop {
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+          Ok(status)
+            if status.rsplit_once(") ").is_some_and(
+              |(_, fields)| {
+                fields.starts_with("Z ") || fields.starts_with("X ")
+              },
+            ) =>
+          {
+            break;
+          }
+          Ok(_) => {}
+          Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound =>
+          {
+            break;
+          }
+          Err(error) => return Err(error),
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+      }
+      Ok(())
+    })
+    .await??;
+    ensure!(!done.exists(), "Cancelled command continued");
+    Ok(())
+  }
+
+  #[cfg(target_os = "linux")]
+  #[tokio::test]
+  #[ignore = "requires Docker engine and KOMODO_SNAPSHOT_TEST_IMAGE"]
+  async fn compose_include_deploy_uses_captured_graph_through_aba()
+  -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    use mogh_resolver::Resolve;
+    use periphery_client::api::compose::ComposeUp;
+
+    if std::env::var_os("KOMODO_CAPTURE_CHILD").is_none() {
+      let image = std::env::var("KOMODO_SNAPSHOT_TEST_IMAGE")?;
+      let fixture = Fixture::new("nested")?;
+      let project =
+        format!("komodo-proof-{}", Uuid::new_v4().simple());
+      let root = &fixture.root;
+      let child = root.join("modules/compose.yaml");
+      let original = format!(
+        "services:\n  child:\n    image: {image}\n    pull_policy: never\n    entrypoint: [sleep, '120']\n    stop_grace_period: 1s\n    environment: {{MARKER: original}}\n"
+      );
+      let changed =
+        original.replace("MARKER: original", "MARKER: changed");
+      fs::write(
+        root.join("compose.yaml"),
+        format!(
+          "include: [modules/compose.yaml]\nservices:\n  root:\n    image: {image}\n    pull_policy: never\n    entrypoint: [sleep, '120']\n    stop_grace_period: 1s\n"
+        ),
+      )?;
+      fs::write(&child, &original)?;
+      fs::write(root.join("changed.yaml"), changed)?;
+      let git = |args: &[&str]| -> anyhow::Result<String> {
+        let output = std::process::Command::new("/usr/bin/git")
+          .args(args)
+          .current_dir(root)
+          .env_clear()
+          .env("PATH", "/usr/bin:/bin")
+          .env("HOME", root)
+          .env("GIT_CONFIG_NOSYSTEM", "1")
+          .output()?;
+        ensure!(
+          output.status.success(),
+          "Synthetic Git setup failed: {}",
+          String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+      };
+      git(&["init", "--initial-branch=main", "working"])?;
+      fs::create_dir(root.join("working/modules"))?;
+      fs::copy(
+        root.join("compose.yaml"),
+        root.join("working/compose.yaml"),
+      )?;
+      fs::copy(&child, root.join("working/modules/compose.yaml"))?;
+      git(&[
+        "-C",
+        "working",
+        "add",
+        "compose.yaml",
+        "modules/compose.yaml",
+      ])?;
+      git(&[
+        "-C",
+        "working",
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "-m",
+        "Synthetic fixture",
+      ])?;
+      let revision = git(&["-C", "working", "rev-parse", "HEAD"])?;
+      fs::create_dir(root.join("git-export"))?;
+      git(&["clone", "--bare", "working", "git-export/repo.git"])?;
+      git(&["--git-dir=git-export/repo.git", "update-server-info"])?;
+      let listener =
+        tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+      let port = listener.local_addr()?.port();
+      drop(listener);
+      let mut git_server =
+        tokio::process::Command::new("/usr/bin/python3")
+          .args([
+            "-m",
+            "http.server",
+            &port.to_string(),
+            "--bind",
+            "127.0.0.1",
+            "--directory",
+          ])
+          .arg(root.join("git-export"))
+          .env_clear()
+          .env("PATH", "/usr/bin:/bin")
+          .env("HOME", root)
+          .stdout(std::process::Stdio::null())
+          .stderr(std::process::Stdio::null())
+          .kill_on_drop(true)
+          .spawn()?;
+      tokio::time::timeout(Duration::from_secs(5), async {
+        while tokio::net::TcpStream::connect(("127.0.0.1", port))
+          .await
+          .is_err()
+        {
+          tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+      })
+      .await?;
+      fs::create_dir(root.join("bin"))?;
+      let wrapper = root.join("bin/docker");
+      fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+config=no
+staged=no
+for arg in "$@"; do
+  [ "$arg" = config ] && config=yes
+  case "$arg" in /proc/*/fd/*) staged=yes ;; esac
+done
+if [ "$config" = yes ] && [ "$staged" = yes ] && [ -e "$KOMODO_CAPTURE_MISMATCH" ]; then
+  printf '{"services":{}}\n'
+  exit 0
+fi
+for arg in "$@"; do
+  if [ "$arg" = up ]; then
+    if [ -e "$KOMODO_CAPTURE_FAIL" ]; then exit 42; fi
+    cp "$KOMODO_CAPTURE_SOURCE" "$KOMODO_CAPTURE_BACKUP" || exit 1
+    cp "$KOMODO_CAPTURE_CHANGED" "$KOMODO_CAPTURE_REPLACEMENT" || exit 1
+    mv "$KOMODO_CAPTURE_REPLACEMENT" "$KOMODO_CAPTURE_SOURCE" || exit 1
+    touch "$KOMODO_CAPTURE_MARKER"
+    /usr/bin/docker "$@"
+    status=$?
+    mv "$KOMODO_CAPTURE_BACKUP" "$KOMODO_CAPTURE_SOURCE" || exit 1
+    exit "$status"
+  fi
+done
+exec /usr/bin/docker "$@"
+"#,
+      )?;
+      fs::set_permissions(
+        &wrapper,
+        fs::Permissions::from_mode(0o700),
+      )?;
+      let test = std::env::current_exe()?;
+      let result = tokio::process::Command::new(test)
+        .args([
+          "--exact",
+          "stack::resolve::tests::compose_include_deploy_uses_captured_graph_through_aba",
+          "--ignored",
+          "--nocapture",
+        ])
+        .env_clear()
+        .env("PATH", format!("{}:/usr/bin:/bin", root.join("bin").display()))
+        .env("HOME", root)
+        .env("KOMODO_CAPTURE_CHILD", root)
+        .env("KOMODO_CAPTURE_PROJECT", &project)
+        .env("KOMODO_CAPTURE_SOURCE", &child)
+        .env("KOMODO_CAPTURE_CHANGED", root.join("changed.yaml"))
+        .env("KOMODO_CAPTURE_BACKUP", root.join("backup.yaml"))
+        .env("KOMODO_CAPTURE_REPLACEMENT", root.join("replacement.yaml"))
+        .env("KOMODO_CAPTURE_MARKER", root.join("race-ran"))
+        .env("KOMODO_CAPTURE_FAIL", root.join("fail-up"))
+        .env("KOMODO_CAPTURE_MISMATCH", root.join("model-mismatch"))
+        .env("KOMODO_CAPTURE_GIT_PROVIDER", format!("127.0.0.1:{port}"))
+        .env("KOMODO_CAPTURE_GIT_REVISION", revision)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("PERIPHERY_STACK_DIR", root.join("managed"))
+        .env("KOMODO_SNAPSHOT_TEST_IMAGE", image)
+        .output()
+        .await?;
+      let server_stop = git_server.kill().await;
+      let server_exit = git_server.wait().await;
+      let cleanup = std::process::Command::new("/usr/bin/docker")
+        .args(["compose", "-p", &project, "-f"])
+        .arg(root.join("compose.yaml"))
+        .args(["down", "--remove-orphans", "--timeout", "2"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", root)
+        .current_dir(root)
+        .output()?;
+      ensure!(
+        cleanup.status.success(),
+        "Cannot clean synthetic deployment: {}",
+        String::from_utf8_lossy(&cleanup.stderr)
+      );
+      let ui_project = format!("{project}-ui");
+      let git_project = format!("{project}-git");
+      for extra_project in [&ui_project, &git_project] {
+        let cleanup = std::process::Command::new("/usr/bin/docker")
+          .args([
+            "compose",
+            "-p",
+            extra_project,
+            "down",
+            "--timeout",
+            "2",
+          ])
+          .env_clear()
+          .env("PATH", "/usr/bin:/bin")
+          .env("HOME", root)
+          .current_dir(root)
+          .output()?;
+        ensure!(
+          cleanup.status.success(),
+          "Cannot clean synthetic deployment: {}",
+          String::from_utf8_lossy(&cleanup.stderr)
+        );
+      }
+      for project in [&project, &ui_project, &git_project] {
+        for kind in ["container", "network"] {
+          let mut command =
+            std::process::Command::new("/usr/bin/docker");
+          command.args([kind, "ls", "-q"]);
+          if kind == "container" {
+            command.arg("--all");
+          }
+          let remaining = command
+            .args([
+              "--filter",
+              &format!("label=com.docker.compose.project={project}"),
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root)
+            .output()?;
+          ensure!(
+            remaining.status.success() && remaining.stdout.is_empty(),
+            "Synthetic {kind} resources remain"
+          );
+        }
+      }
+      ensure!(
+        result.status.success(),
+        "Captured deployment subprocess failed:\n{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+      );
+      server_stop.context("Cannot stop synthetic Git server")?;
+      server_exit.context("Cannot reap synthetic Git server")?;
+      return Ok(());
+    }
+
+    let root = PathBuf::from(
+      std::env::var_os("KOMODO_CAPTURE_CHILD").unwrap(),
+    );
+    let project = std::env::var("KOMODO_CAPTURE_PROJECT")?;
+    let mut request = host_request_at(&root);
+    request.stack.name = project.clone();
+    request.stack.config.environment.clear();
+    request.stack.config.pre_deploy = Default::default();
+    request.stack.config.post_deploy = Default::default();
+    request.stack.config.auto_pull = false;
+    let stack = request.stack.clone();
+    let response = resolve_host_sources(
+      request,
+      Path::new("/unused"),
+      Path::new("/synthetic/periphery"),
+      &HashMap::new(),
+      Instant::now() + Duration::from_secs(10),
+      async |worker, _, _| {
+        resolve_in_context(&root, worker, BTreeMap::new(), async |_, _, _| {
+          Ok(r#"{"services":{"root":{"image":"synthetic/root"},"child":{"image":"synthetic/child"}}}"#.into())
+        }).await
+      },
+    ).await?;
+    let ResolveComposeStackResponse::Success {
+      request_identity,
+      observed_snapshot,
+      dependencies,
+      ..
+    } = response
+    else {
+      anyhow::bail!("Synthetic discovery failed");
+    };
+    let expected =
+      komodo_client::entities::stack::AcceptedComposeResolution {
+        deployment_proven: false,
+        source_identity:
+          komodo_client::entities::stack::ComposeSourceIdentity {
+            request_identity,
+            observed_snapshot,
+          },
+        dependencies,
+      };
+    let up = ComposeUp {
+      stack,
+      services: Vec::new(),
+      repo: None,
+      git_token: None,
+      registry_token: None,
+      replacers: Vec::new(),
+      expected_resolution: Some(expected.clone()),
+      supports_deployment_proof: true,
+    };
+    let args = crate::api::Args {
+      core: "synthetic".into(),
+      id: Uuid::new_v4(),
+    };
+    let result = up.clone().resolve(&args).await?;
+    ensure!(
+      result.deployed,
+      "Synthetic ComposeUp failed: {:?}",
+      result.logs
+    );
+    let evidence = result
+      .deployed_resolution
+      .context("Missing deployment proof")?;
+    ensure!(
+      evidence.deployment_proven,
+      "Deployment proof was not marked verified"
+    );
+    ensure!(
+      evidence.dependencies == expected.dependencies,
+      "Proof does not describe the captured graph"
+    );
+    ensure!(
+      root.join("race-ran").exists(),
+      "The A-B-A race did not run"
+    );
+    let child = std::process::Command::new("/usr/bin/docker")
+      .args([
+        "ps",
+        "-q",
+        "--filter",
+        &format!("label=com.docker.compose.project={project}"),
+        "--filter",
+        "label=com.docker.compose.service=child",
+      ])
+      .output()?;
+    ensure!(child.status.success(), "Cannot find child container");
+    let id = String::from_utf8(child.stdout)?;
+    ensure!(!id.trim().is_empty(), "Child container was not started");
+    let inspect = std::process::Command::new("/usr/bin/docker")
+      .args([
+        "inspect",
+        "--format",
+        "{{json .Config.Env}}",
+        id.trim(),
+      ])
+      .output()?;
+    ensure!(
+      inspect.status.success(),
+      "Cannot inspect child container"
+    );
+    let environment: Vec<String> =
+      serde_json::from_slice(&inspect.stdout)?;
+    ensure!(
+      environment.iter().any(|entry| entry == "MARKER=original"),
+      "Container did not use captured child"
+    );
+    ensure!(
+      !environment.iter().any(|entry| entry == "MARKER=changed"),
+      "Container used the replacement child"
+    );
+
+    fs::write(root.join("model-mismatch"), "")?;
+    let mismatch = up.clone().resolve(&args).await?;
+    ensure!(
+      mismatch.deployed && mismatch.deployed_resolution.is_none(),
+      "A changed captured model must fall back without proof"
+    );
+    fs::remove_file(root.join("model-mismatch"))?;
+
+    let source = root.join("modules/compose.yaml");
+    let original = fs::read_to_string(&source)?;
+    fs::write(root.join("modules/service.env"), "EXTRA=synthetic\n")?;
+    fs::write(
+      &source,
+      format!("{original}    env_file: service.env\n"),
+    )?;
+    let unverified = up.clone().resolve(&args).await?;
+    ensure!(
+      unverified.deployed,
+      "Unsupported input must retain manual deployment"
+    );
+    ensure!(
+      unverified.deployed_resolution.is_none(),
+      "Unsupported input was marked verified"
+    );
+    fs::write(
+      &source,
+      original.replace(
+        "MARKER: original",
+        "MARKER: '${UNTRACKED:-original}'",
+      ),
+    )?;
+    let unverified = up.clone().resolve(&args).await?;
+    ensure!(
+      unverified.deployed && unverified.deployed_resolution.is_none(),
+      "Interpolation must deploy manually without verified evidence"
+    );
+    fs::write(&source, original)?;
+
+    fs::write(root.join("fail-up"), "")?;
+    let failed = up.clone().resolve(&args).await?;
+    ensure!(
+      !failed.deployed,
+      "Failed Compose up was reported successful"
+    );
+    ensure!(
+      failed.deployed_resolution.is_none(),
+      "Failed Compose up returned proof"
+    );
+    fs::remove_file(root.join("fail-up"))?;
+
+    let single_source =
+      fs::read_to_string(root.join("compose.yaml"))?
+        .replace("include: [modules/compose.yaml]\n", "");
+    fs::write(root.join("single.yaml"), single_source)?;
+    let mut single_stack = up.stack.clone();
+    single_stack.config.file_paths = vec!["single.yaml".into()];
+    let mut single_request = host_request_at(&root);
+    single_request.stack = single_stack.clone();
+    let response = resolve_host_sources(
+      single_request,
+      Path::new("/unused"),
+      Path::new("/synthetic/periphery"),
+      &HashMap::new(),
+      Instant::now() + Duration::from_secs(10),
+      async |worker, _, _| {
+        let mut worker = worker.clone();
+        worker.mode = WorkerMode::Refresh { legacy_cli: false };
+        resolve_in_context(
+          &root,
+          &worker,
+          BTreeMap::new(),
+          async |_, _, _| {
+            panic!("No-include discovery must not invoke Compose")
+          },
+        )
+        .await
+      },
+    )
+    .await?;
+    let ResolveComposeStackResponse::Success {
+      request_identity,
+      observed_snapshot,
+      dependencies,
+      ..
+    } = response
+    else {
+      anyhow::bail!("Synthetic no-include discovery failed");
+    };
+    let single_expected =
+      komodo_client::entities::stack::AcceptedComposeResolution {
+        deployment_proven: false,
+        source_identity:
+          komodo_client::entities::stack::ComposeSourceIdentity {
+            request_identity,
+            observed_snapshot,
+          },
+        dependencies,
+      };
+    let single_result = ComposeUp {
+      stack: single_stack,
+      services: Vec::new(),
+      repo: None,
+      git_token: None,
+      registry_token: None,
+      replacers: Vec::new(),
+      expected_resolution: Some(single_expected.clone()),
+      supports_deployment_proof: true,
+    }
+    .resolve(&args)
+    .await?;
+    let single_evidence = single_result
+      .deployed_resolution
+      .context("Missing no-include deployment proof")?;
+    ensure!(
+      single_result.deployed
+        && single_evidence.deployment_proven
+        && single_evidence.dependencies
+          == single_expected.dependencies,
+      "No-include deployment did not use the discovered captured graph"
+    );
+
+    let mut ui = komodo_client::entities::stack::Stack::default();
+    ui.id = "b".repeat(24);
+    ui.name = format!("{project}-ui");
+    ui.config.file_contents =
+      fs::read_to_string(root.join("compose.yaml"))?;
+    ui.config.inline_files =
+      vec![komodo_client::entities::FileContents {
+        path: "modules/compose.yaml".into(),
+        contents: fs::read_to_string(
+          root.join("modules/compose.yaml"),
+        )?,
+      }];
+    ui.config.auto_pull = false;
+    let ui_request = ResolveComposeStack {
+      request_identity: ResolutionRequestIdentity {
+        stack_id: ui.id.clone(),
+        config_generation: "ui-generation".into(),
+        source: ComposeResolutionSource::Ui,
+      },
+      stack: ui.clone(),
+      repo: None,
+      git_token: None,
+      replacers: Vec::new(),
+    };
+    let response = super::super::inline::resolve_ui_sources(
+      ui_request,
+      Path::new("/synthetic/periphery"),
+      &HashMap::new(),
+      Instant::now() + Duration::from_secs(10),
+      async |worker, _, _| {
+        let directory = worker.source_root.clone().unwrap();
+        resolve_in_context(&directory, worker, BTreeMap::new(), async |_, _, _| {
+          Ok(r#"{"services":{"root":{"image":"synthetic/root"},"child":{"image":"synthetic/child"}}}"#.into())
+        }).await
+      },
+    ).await?;
+    let ResolveComposeStackResponse::Success {
+      request_identity,
+      observed_snapshot,
+      dependencies,
+      ..
+    } = response
+    else {
+      anyhow::bail!("Synthetic UI discovery failed");
+    };
+    let ui_expected =
+      komodo_client::entities::stack::AcceptedComposeResolution {
+        deployment_proven: false,
+        source_identity:
+          komodo_client::entities::stack::ComposeSourceIdentity {
+            request_identity,
+            observed_snapshot,
+          },
+        dependencies,
+      };
+    let ui_up = ComposeUp {
+      stack: ui.clone(),
+      services: Vec::new(),
+      repo: None,
+      git_token: None,
+      registry_token: None,
+      replacers: Vec::new(),
+      expected_resolution: Some(ui_expected.clone()),
+      supports_deployment_proof: true,
+    };
+    let ui_result = ui_up.clone().resolve(&args).await?;
+    let ui_evidence = ui_result
+      .deployed_resolution
+      .context("Missing UI deployment proof")?;
+    ensure!(
+      ui_result.deployed
+        && ui_evidence.deployment_proven
+        && ui_evidence.dependencies == ui_expected.dependencies,
+      "UI deployment did not use the discovered captured graph"
+    );
+    let ui_child = || -> anyhow::Result<String> {
+      let output = std::process::Command::new("/usr/bin/docker")
+        .args([
+          "ps",
+          "-q",
+          "--filter",
+          &format!("label=com.docker.compose.project={}", ui.name),
+          "--filter",
+          "label=com.docker.compose.service=child",
+        ])
+        .output()?;
+      ensure!(
+        output.status.success(),
+        "Cannot find UI child container"
+      );
+      let id = String::from_utf8(output.stdout)?;
+      ensure!(!id.trim().is_empty(), "UI child did not start");
+      Ok(id)
+    };
+    let id = ui_child()?;
+    let ui_again = ui_up.clone().resolve(&args).await?;
+    ensure!(
+      ui_again
+        .deployed_resolution
+        .is_some_and(|evidence| evidence.deployment_proven),
+      "UI redeployment was not verified"
+    );
+    ensure!(ui_child()? == id, "Unchanged UI child was recreated");
+
+    let mut legacy_request = serde_json::to_value(&ui_up)?;
+    legacy_request
+      .as_object_mut()
+      .context("Invalid request")?
+      .remove("supports_deployment_proof");
+    let legacy_up: ComposeUp =
+      serde_json::from_value(legacy_request)?;
+    ensure!(
+      !legacy_up.supports_deployment_proof,
+      "Legacy caller unexpectedly negotiated proof"
+    );
+    let legacy_result = legacy_up.resolve(&args).await?;
+    ensure!(
+      legacy_result.deployed
+        && legacy_result.deployed_resolution.is_none(),
+      "Legacy caller received an incompatible proof"
+    );
+
+    let provider = std::env::var("KOMODO_CAPTURE_GIT_PROVIDER")?;
+    let revision = std::env::var("KOMODO_CAPTURE_GIT_REVISION")?;
+    let mut git_stack =
+      komodo_client::entities::stack::Stack::default();
+    git_stack.id = "c".repeat(24);
+    git_stack.name = format!("{project}-git");
+    git_stack.config.git_provider = provider.clone();
+    git_stack.config.git_https = false;
+    git_stack.config.repo = "repo.git".into();
+    git_stack.config.branch = "main".into();
+    git_stack.config.run_directory = ".".into();
+    git_stack.config.auto_pull = false;
+    let git_request = ResolveComposeStack {
+      request_identity: ResolutionRequestIdentity {
+        stack_id: git_stack.id.clone(),
+        config_generation: "git-generation".into(),
+        source: ComposeResolutionSource::Repository {
+          provider,
+          repository: "repo.git".into(),
+          commit_id: revision.clone(),
+          run_directory: ".".into(),
+        },
+      },
+      stack: git_stack.clone(),
+      repo: None,
+      git_token: None,
+      replacers: Vec::new(),
+    };
+    let response = super::super::repository::resolve_repository_sources(
+      git_request,
+      Path::new("/synthetic/periphery"),
+      &HashMap::new(),
+      Instant::now() + Duration::from_secs(30),
+      CancellationToken::new(),
+      async |worker, _, _| {
+        let directory = worker.source_root.clone().unwrap();
+        resolve_in_context(&directory, worker, BTreeMap::new(), async |_, _, _| {
+          Ok(r#"{"services":{"root":{"image":"synthetic/root"},"child":{"image":"synthetic/child"}}}"#.into())
+        }).await
+      },
+    ).await?;
+    let ResolveComposeStackResponse::Success {
+      request_identity,
+      observed_snapshot,
+      dependencies,
+      ..
+    } = response
+    else {
+      anyhow::bail!("Synthetic Git discovery failed");
+    };
+    let git_expected =
+      komodo_client::entities::stack::AcceptedComposeResolution {
+        deployment_proven: false,
+        source_identity:
+          komodo_client::entities::stack::ComposeSourceIdentity {
+            request_identity,
+            observed_snapshot,
+          },
+        dependencies,
+      };
+    let git_result = ComposeUp {
+      stack: git_stack,
+      services: Vec::new(),
+      repo: None,
+      git_token: None,
+      registry_token: None,
+      replacers: Vec::new(),
+      expected_resolution: Some(git_expected.clone()),
+      supports_deployment_proof: true,
+    }
+    .resolve(&args)
+    .await?;
+    let git_evidence = git_result
+      .deployed_resolution
+      .context("Missing Git deployment proof")?;
+    ensure!(
+      git_result.deployed
+        && git_evidence.deployment_proven
+        && git_evidence.dependencies == git_expected.dependencies
+        && git_evidence
+          .source_identity
+          .observed_snapshot
+          .commit_id
+          .as_deref()
+          == Some(revision.as_str()),
+      "Git deployment did not use the discovered captured revision"
+    );
     Ok(())
   }
 
@@ -2262,6 +3212,7 @@ mod tests {
     Ok(())
   }
 
+  #[cfg(target_os = "linux")]
   #[tokio::test]
   async fn compose_include_host_dropped_request_kills_owned_wrapper_descendants()
   -> anyhow::Result<()> {
@@ -2317,7 +3268,8 @@ mod tests {
           }
           Ok(_) => {}
           Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound =>
+            if error.kind() == std::io::ErrorKind::NotFound
+              || error.raw_os_error() == Some(libc::ESRCH) =>
           {
             break;
           }

@@ -245,6 +245,7 @@ impl Resolve<ExecuteArgs> for DeployStack {
             registry_token,
             replacers: secret_replacers.into_iter().collect(),
             expected_resolution: expected_resolution.clone(),
+            supports_deployment_proof: true,
           })
           .await?
       }
@@ -896,7 +897,18 @@ fn restart_resolution(
     Some(ComposeResolutionState::Success(expected)),
     Some(observed),
   ) = (current, observed)
-    && &observed == expected
+    && observed.deployment_proven
+    && observed.source_identity == expected.source_identity
+    && observed.dependencies == expected.dependencies
+    && observed.source_identity.observed_snapshot.complete
+    && observed
+      .source_identity
+      .observed_snapshot
+      .validate(
+        &observed.source_identity.request_identity,
+        &observed.dependencies,
+      )
+      .is_ok()
   {
     return (observed, true);
   }
@@ -960,6 +972,7 @@ fn deployment_resolution(
     }
     if expected == accepted
       && identity == observed.source_identity.request_identity
+      && observed.deployment_proven
       && observed.source_identity.observed_snapshot.complete
       && observed
         .source_identity
@@ -996,6 +1009,7 @@ mod compose_diff_tests {
     dependencies: Vec<DerivedComposeDependency>,
   ) -> AcceptedComposeResolution {
     AcceptedComposeResolution {
+      deployment_proven: true,
       source_identity: ComposeSourceIdentity {
         request_identity: ResolutionRequestIdentity {
           stack_id: "stack-id".into(),
@@ -1122,6 +1136,19 @@ mod compose_diff_tests {
   }
 
   #[test]
+  fn compose_include_diff_rejects_legacy_observational_deployment() {
+    let dependencies = vec![dependency("compose.yaml", "compose")];
+    let mut state = info(dependencies.clone(), dependencies);
+    let mut legacy =
+      serde_json::to_value(state.deployed_resolution.take().unwrap())
+        .unwrap();
+    legacy.as_object_mut().unwrap().remove("deployment_proven");
+    state.deployed_resolution =
+      Some(serde_json::from_value(legacy).unwrap());
+    assert!(resolve_discovered_deploy_action(&state, &[]).is_err());
+  }
+
+  #[test]
   fn compose_include_restart_tracks_only_observed_sources()
   -> anyhow::Result<()> {
     let mut auxiliary = dependency("settings.conf", "auxiliary");
@@ -1167,6 +1194,15 @@ mod compose_diff_tests {
       deployment_resolution(&state.resolution, Some(&expected), None);
     assert!(resolve_discovered_deploy_action(&state, &[]).is_err());
 
+    let mut unproven = expected.clone();
+    unproven.deployment_proven = false;
+    state.deployed_resolution = deployment_resolution(
+      &state.resolution,
+      Some(&expected),
+      Some(unproven),
+    );
+    assert!(resolve_discovered_deploy_action(&state, &[]).is_err());
+
     let mut changed = expected.dependencies.clone();
     changed[0].fingerprint = "b".repeat(64);
     let observed = accepted(changed.clone());
@@ -1197,6 +1233,60 @@ mod compose_diff_tests {
     .unwrap();
     assert!(!deployed.source_identity.observed_snapshot.complete);
     Ok(())
+  }
+
+  #[test]
+  fn compose_include_deployment_rejects_observations_even_when_equal()
+  {
+    let mut observation =
+      accepted(vec![dependency("compose.yaml", "compose")]);
+    observation.deployment_proven = false;
+    let state =
+      Some(ComposeResolutionState::Success(observation.clone()));
+    let deployed = deployment_resolution(
+      &state,
+      Some(&observation),
+      Some(observation.clone()),
+    )
+    .unwrap();
+    assert!(!deployed.deployment_proven);
+    assert!(!deployed.source_identity.observed_snapshot.complete);
+    let (restarted, proven) = restart_resolution(
+      observation.clone(),
+      state.as_ref(),
+      Some(observation),
+    );
+    assert!(!proven);
+    assert!(!restarted.source_identity.observed_snapshot.complete);
+  }
+
+  #[test]
+  fn compose_include_restart_rejects_invalid_proof() {
+    let mut observation =
+      accepted(vec![dependency("compose.yaml", "compose")]);
+    observation.source_identity.observed_snapshot.complete = false;
+    let current =
+      ComposeResolutionState::Success(observation.clone());
+    let (_, proven) = restart_resolution(
+      observation.clone(),
+      Some(&current),
+      Some(observation.clone()),
+    );
+    assert!(!proven);
+    observation.source_identity.observed_snapshot.complete = true;
+    observation
+      .source_identity
+      .observed_snapshot
+      .dependency_fingerprints
+      .clear();
+    let current =
+      ComposeResolutionState::Success(observation.clone());
+    let (_, proven) = restart_resolution(
+      observation.clone(),
+      Some(&current),
+      Some(observation),
+    );
+    assert!(!proven);
   }
 
   #[test]
@@ -1278,6 +1368,10 @@ fn resolve_discovered_deploy_action(
   let Some(deployed) = &info.deployed_resolution else {
     return Ok(DeployIfChangedAction::FullDeploy);
   };
+  anyhow::ensure!(
+    deployed.deployment_proven,
+    "Deployed Compose source identity is unverified; automatic source-change decisions are unavailable"
+  );
   anyhow::ensure!(
     deployed.source_identity.observed_snapshot.complete,
     "Deployed Compose source snapshot is incomplete; cannot compare changes"

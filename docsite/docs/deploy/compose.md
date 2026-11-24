@@ -94,7 +94,9 @@ limits fail explicitly. No source fallback substitutes only explicit roots.
 
 Compatibility upgrades must move Core and Periphery together. An older Periphery with
 companions is rejected before deploy, pull, or run instead of silently deploying only
-the primary root. Swarm stacks remain on the existing deployment path.
+the primary root. Older Core versions cannot read persisted verified-deployment evidence;
+restore a compatible database backup before downgrading Core. Swarm stacks remain on the
+existing deployment path.
 
 The trusted `compose_cmd_wrapper` runs for wrappers selected by
 `compose_cmd_wrapper_include`; background discovery may therefore inherit wrapper
@@ -104,14 +106,21 @@ active Git checkout.
 
 A failed refresh clears latest service discovery, reports a safe error, and blocks
 change-driven deployment and automatic update decisions without changing deployed state.
-For a full deployment without a command wrapper, Periphery checks the local source
-snapshot immediately before and after Compose runs. If the sources changed during
-deployment, or the snapshot cannot be verified, the deployment can still succeed but
-source-based change comparisons stop with an error. Remote includes, command wrappers,
-and selective service deployments cannot currently produce a verified deployed snapshot.
-For change-driven restarts, Periphery checks the sources before and after the restart.
-If they differ before the restart, it stops without restarting. If they change during the
-restart, the deployed snapshot is incomplete until a verified full deployment.
+On Linux, supported full deployments use sealed copies of the Compose and
+environment sources for both configuration and deployment. Evidence comes from the
+same captured sources. Docker records temporary source paths in its Compose config-files
+labels; those paths expire after the operation. Komodo retains the configured original
+paths in the Stack configuration, but its Compose project listing and external tools
+that use the labels may display paths they cannot reopen.
+
+Verification currently excludes interpolation in Compose sources, inherited service
+environment values, service `env_file`, `extends`, builds, configs, secrets, tracked
+auxiliary files, remote includes, wrappers, selective services, custom `up` arguments,
+post-deploy hooks, Compose environment controls, YAML tags or merges, unknown fields,
+and no-include stacks with environment files. Manual deployment still works for these
+cases, but it does not establish verified source evidence. Automatic source comparisons
+fail explicitly until a verified deployment is available. Restart-only operations also
+cannot establish verified evidence from before/after observations.
 
 ## Importing Existing Projects
 

@@ -193,6 +193,7 @@ fn accept(
       info.latest_message = commit_message;
       info.resolution = Some(ComposeResolutionState::Success(
         AcceptedComposeResolution {
+          deployment_proven: false,
           source_identity: ComposeSourceIdentity {
             request_identity,
             observed_snapshot,
@@ -587,6 +588,7 @@ mod tests {
     };
     stack.info.resolution = Some(ComposeResolutionState::Success(
       AcceptedComposeResolution {
+        deployment_proven: false,
         source_identity: ComposeSourceIdentity {
           request_identity: identity,
           observed_snapshot: ObservedComposeSnapshot {

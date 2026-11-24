@@ -453,7 +453,10 @@ impl Resolve<crate::api::Args> for ComposeUp {
       registry_token,
       mut replacers,
       expected_resolution,
+      supports_deployment_proof,
     } = self;
+    #[cfg(not(target_os = "linux"))]
+    let _ = supports_deployment_proof;
 
     let mut res = DeployStackResponse::default();
 
@@ -544,13 +547,6 @@ impl Resolve<crate::api::Args> for ComposeUp {
       env_file_path,
       &stack.config.additional_env_files,
     );
-    let compose_command = compose_command(
-      docker_compose,
-      &project_name,
-      stack.compose_file_paths(),
-      &env_files,
-    );
-
     // Parse wrapper configuration once for reuse
     let compose_cmd_wrapper =
       parse_multiline_command(&stack.config.compose_cmd_wrapper);
@@ -565,31 +561,113 @@ impl Resolve<crate::api::Args> for ComposeUp {
         &stack.config.compose_cmd_wrapper_include
       };
 
+    #[cfg(target_os = "linux")]
     let verifiable = expected_resolution.as_ref().filter(|_| {
       services.is_empty()
         && stack.config.compose_cmd_wrapper.trim().is_empty()
     });
-    let before_config = if let Some(expected) = verifiable {
-      deployment_evidence(
-        &stack,
-        &run_directory,
-        &env_files,
-        expected,
-        &replacers,
-      )
-      .await
+    #[cfg(target_os = "linux")]
+    let mut capture = if let Some(expected) =
+      verifiable.filter(|_| {
+        supports_deployment_proof
+          && !stack.config.run_build
+          && stack.config.extra_args.is_empty()
+          && stack.config.post_deploy.is_none()
+      }) {
+      match deployment_revision(&stack, &run_directory, expected)
+        .await
+      {
+        Some(revision) => {
+          match crate::stack::resolve::capture_current_deployment(
+            &stack,
+            &run_directory,
+            &env_files,
+            expected,
+            &replacers,
+            revision.as_deref(),
+          ) {
+            Ok(capture) => capture.map(std::sync::Arc::new),
+            Err(error) => {
+              warn!(%error, "Unable to capture Compose sources");
+              None
+            }
+          }
+        }
+        None => None,
+      }
     } else {
       None
     };
+    #[cfg(target_os = "linux")]
+    if let Some(candidate) = &capture
+      && !captured_model_matches(
+        docker_compose,
+        &project_name,
+        stack.compose_file_paths(),
+        &env_files,
+        &run_directory,
+        candidate.clone(),
+      )
+      .await
+    {
+      warn!(
+        "Captured Compose model did not match the original model"
+      );
+      capture = None;
+    }
+    #[cfg(target_os = "linux")]
+    let captured_arguments = capture.as_ref().map(|capture| {
+      (
+        format!(
+          "{docker_compose} --project-directory {}",
+          escape(capture.compose.project_directory.to_string_lossy())
+        ),
+        capture
+          .compose
+          .roots
+          .iter()
+          .map(|path| path.to_string_lossy().into_owned())
+          .collect::<Vec<_>>(),
+        capture
+          .compose
+          .env_files
+          .iter()
+          .map(|path| path.to_string_lossy().into_owned())
+          .collect::<Vec<_>>(),
+      )
+    });
+    #[cfg(not(target_os = "linux"))]
+    let captured_arguments: Option<(
+      String,
+      Vec<String>,
+      Vec<String>,
+    )> = None;
+    let (compose_cli, compose_roots, compose_env_files) =
+      captured_arguments
+        .as_ref()
+        .map(|(cli, roots, env)| {
+          (cli.as_str(), roots.as_slice(), env.as_slice())
+        })
+        .unwrap_or((
+          docker_compose,
+          stack.compose_file_paths(),
+          &env_files,
+        ));
+    let compose_command = compose_command(
+      compose_cli,
+      &project_name,
+      compose_roots,
+      compose_env_files,
+    );
 
     // Uses 'docker compose config' command to extract services (including image)
     // after performing interpolation
     {
       let command = config_command(
-        docker_compose,
+        compose_cli,
         &project_name,
-        stack.compose_file_paths(),
-        &env_files,
+        compose_roots,
+        compose_env_files,
         ConfigFormat::Yaml,
       );
       let (command, wrapped) = match maybe_wrap_command(
@@ -605,7 +683,25 @@ impl Resolve<crate::api::Args> for ComposeUp {
         }
       };
       let span = info_span!("GetComposeConfig", command);
-      let mut config_log = if wrapped {
+      #[cfg(target_os = "linux")]
+      let captured_log = if let Some(capture) = &capture {
+        Some(
+          run_captured_command(
+            "Compose Config",
+            command.clone(),
+            run_directory.clone(),
+            capture.clone(),
+          )
+          .await,
+        )
+      } else {
+        None
+      };
+      #[cfg(not(target_os = "linux"))]
+      let captured_log: Option<Log> = None;
+      let mut config_log = if let Some(log) = captured_log {
+        log
+      } else if wrapped {
         run_komodo_shell_command(
           "Compose Config",
           command,
@@ -654,22 +750,6 @@ impl Resolve<crate::api::Args> for ComposeUp {
       config_log.sanitize(&replacers);
       res.logs.push(config_log);
     }
-
-    let config_evidence = if let (Some(expected), Some(before)) =
-      (verifiable, before_config)
-    {
-      let after = deployment_evidence(
-        &stack,
-        &run_directory,
-        &env_files,
-        expected,
-        &replacers,
-      )
-      .await;
-      (after.as_ref() == Some(&before)).then_some(before)
-    } else {
-      None
-    };
 
     if stack.config.run_build {
       let build_extra_args =
@@ -736,17 +816,36 @@ impl Resolve<crate::api::Args> for ComposeUp {
         KomodoCommandMode::Standard
       };
       let span = info_span!("RunComposePull");
-      let Some(log) = run_komodo_command_with_sanitization(
-        "Compose Pull",
-        command,
-        CommandOptions::default().path(run_directory.as_path()),
-        mode,
-        &replacers,
-      )
-      .instrument(span)
-      .await
-      else {
-        unreachable!()
+      #[cfg(target_os = "linux")]
+      let captured_log = if let Some(capture) = &capture {
+        let mut log = run_captured_command(
+          "Compose Pull",
+          command.clone(),
+          run_directory.clone(),
+          capture.clone(),
+        )
+        .instrument(span.clone())
+        .await;
+        log.sanitize(&replacers);
+        Some(log)
+      } else {
+        None
+      };
+      #[cfg(not(target_os = "linux"))]
+      let captured_log: Option<Log> = None;
+      let log = if let Some(log) = captured_log {
+        log
+      } else {
+        run_komodo_command_with_sanitization(
+          "Compose Pull",
+          command,
+          CommandOptions::default().path(run_directory.as_path()),
+          mode,
+          &replacers,
+        )
+        .instrument(span)
+        .await
+        .expect("Compose pull command is not empty")
       };
       res.logs.push(log);
       if !all_logs_success(&res.logs) {
@@ -782,57 +881,55 @@ impl Resolve<crate::api::Args> for ComposeUp {
       }
     };
 
-    let before = if let (Some(expected), Some(_)) =
-      (verifiable, &config_evidence)
-    {
-      deployment_evidence(
-        &stack,
-        &run_directory,
-        &env_files,
-        expected,
-        &replacers,
+    let span = info_span!("ExecuteComposeUp");
+    #[cfg(target_os = "linux")]
+    let captured_log = if let Some(capture) = &capture {
+      let mut log = run_captured_command(
+        "Compose Up",
+        command.clone(),
+        run_directory.clone(),
+        capture.clone(),
       )
-      .await
+      .instrument(span.clone())
+      .await;
+      log.sanitize(&replacers);
+      Some(log)
     } else {
       None
     };
-
-    let span = info_span!("ExecuteComposeUp");
-    let Some(log) = run_komodo_command_with_sanitization(
-      "Compose Up",
-      command,
-      CommandOptions::default().path(run_directory.as_path()),
-      KomodoCommandMode::Shell,
-      &replacers,
-    )
-    .instrument(span)
-    .await
-    else {
-      unreachable!()
+    #[cfg(not(target_os = "linux"))]
+    let captured_log: Option<Log> = None;
+    let log = if let Some(log) = captured_log {
+      log
+    } else {
+      run_komodo_command_with_sanitization(
+        "Compose Up",
+        command,
+        CommandOptions::default().path(run_directory.as_path()),
+        KomodoCommandMode::Shell,
+        &replacers,
+      )
+      .instrument(span)
+      .await
+      .expect("Compose up command is not empty")
     };
 
     res.deployed = log.success;
     res.logs.push(log);
-    if let Some(expected) = verifiable
-      && res.deployed
-      && let Some(before) = before
-      && config_evidence.as_ref() == Some(&before)
+    #[cfg(target_os = "linux")]
+    if res.deployed
+      && let Some(capture) = &capture
     {
-      let after = deployment_evidence(
-        &stack,
-        &run_directory,
-        &env_files,
-        expected,
-        &replacers,
-      )
-      .await;
-      if after.as_ref() == Some(&before) {
-        res.deployed_resolution = Some(before);
-      }
+      let mut evidence = capture.evidence.clone();
+      evidence.deployment_proven = true;
+      res.deployed_resolution = Some(evidence);
     }
     if res.deployed
       && expected_resolution.is_some()
-      && res.deployed_resolution.is_none()
+      && res
+        .deployed_resolution
+        .as_ref()
+        .is_none_or(|resolution| !resolution.deployment_proven)
     {
       res.logs.push(Log::simple(
         "Compose source tracking",
@@ -866,14 +963,114 @@ impl Resolve<crate::api::Args> for ComposeUp {
   }
 }
 
-async fn deployment_evidence(
+#[cfg(target_os = "linux")]
+async fn captured_model_matches(
+  cli: &str,
+  project: &str,
+  roots: &[String],
+  env_files: &[String],
+  directory: &std::path::Path,
+  capture: std::sync::Arc<crate::stack::resolve::DeploymentCapture>,
+) -> bool {
+  let original = config_command(
+    cli,
+    project,
+    roots,
+    env_files,
+    ConfigFormat::Json,
+  );
+  let original = run_komodo_standard_command(
+    "Original Compose model",
+    original,
+    CommandOptions::default()
+      .path(directory)
+      .env(&capture.environment)
+      .clear_env(true)
+      .output_limit(64 * 1024 * 1024),
+  )
+  .await;
+  if !original.success {
+    return false;
+  }
+  let captured_cli = format!(
+    "{cli} --project-directory {}",
+    escape(capture.compose.project_directory.to_string_lossy())
+  );
+  let captured_roots = capture
+    .compose
+    .roots
+    .iter()
+    .map(|path| path.to_string_lossy().into_owned())
+    .collect::<Vec<_>>();
+  let captured_env = capture
+    .compose
+    .env_files
+    .iter()
+    .map(|path| path.to_string_lossy().into_owned())
+    .collect::<Vec<_>>();
+  let captured = run_captured_command(
+    "Captured Compose model",
+    config_command(
+      &captured_cli,
+      project,
+      &captured_roots,
+      &captured_env,
+      ConfigFormat::Json,
+    ),
+    directory.to_path_buf(),
+    capture,
+  )
+  .await;
+  if !captured.success {
+    return false;
+  }
+  match (
+    serde_json::from_str::<serde_json::Value>(&original.stdout),
+    serde_json::from_str::<serde_json::Value>(&captured.stdout),
+  ) {
+    (Ok(original), Ok(captured)) => original == captured,
+    _ => false,
+  }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn run_captured_command(
+  stage: &'static str,
+  command: String,
+  directory: PathBuf,
+  capture: std::sync::Arc<crate::stack::resolve::DeploymentCapture>,
+) -> Log {
+  let cancel = tokio_util::sync::CancellationToken::new();
+  let _cancel_on_drop = cancel.clone().drop_guard();
+  // The task retains the descriptors while it cancels the command group.
+  match tokio::spawn(async move {
+    run_komodo_standard_command(
+      stage,
+      command,
+      CommandOptions::default()
+        .path(directory.as_path())
+        .env(&capture.environment)
+        .clear_env(true)
+        .cancel(cancel)
+        .output_limit(64 * 1024 * 1024),
+    )
+    .await
+  })
+  .await
+  {
+    Ok(log) => log,
+    Err(error) => Log::error(
+      stage,
+      format!("Captured Compose command task failed: {error}"),
+    ),
+  }
+}
+
+async fn deployment_revision(
   stack: &komodo_client::entities::stack::Stack,
   directory: &std::path::Path,
-  env_files: &[String],
   expected: &komodo_client::entities::stack::AcceptedComposeResolution,
-  replacers: &[(String, String)],
-) -> Option<komodo_client::entities::stack::AcceptedComposeResolution>
-{
+) -> Option<Option<String>> {
   use komodo_client::entities::stack::ComposeResolutionSource;
   let (source_matches, revision) =
     match &expected.source_identity.request_identity.source {
@@ -903,6 +1100,19 @@ async fn deployment_evidence(
   if !source_matches {
     return None;
   }
+  Some(revision)
+}
+
+async fn deployment_evidence(
+  stack: &komodo_client::entities::stack::Stack,
+  directory: &std::path::Path,
+  env_files: &[String],
+  expected: &komodo_client::entities::stack::AcceptedComposeResolution,
+  replacers: &[(String, String)],
+) -> Option<komodo_client::entities::stack::AcceptedComposeResolution>
+{
+  let revision =
+    deployment_revision(stack, directory, expected).await?;
   match crate::stack::resolve::deployment_snapshot(
     stack,
     directory,
@@ -1065,7 +1275,8 @@ where
   let after = if log.success { observe().await } else { None };
   ComposeRestartObservedResponse {
     log,
-    observed_resolution: after.filter(|value| value == expected),
+    observed_resolution: after
+      .filter(|value| value.deployment_proven && value == expected),
   }
 }
 
@@ -1385,6 +1596,7 @@ mod resolution_tests {
       atomic::{AtomicUsize, Ordering},
     };
     let expected = AcceptedComposeResolution {
+      deployment_proven: false,
       source_identity: ComposeSourceIdentity {
         request_identity: ResolutionRequestIdentity {
           stack_id: "stack".into(),
@@ -1441,7 +1653,7 @@ mod resolution_tests {
       assert_eq!(response.log.success, before && succeeds);
       assert_eq!(
         response.observed_resolution.is_some(),
-        before && after && succeeds
+        before && after && succeeds && expected.deployment_proven
       );
     }
   }

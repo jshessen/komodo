@@ -1,8 +1,9 @@
 use std::{
-  collections::{BTreeMap, BTreeSet},
+  collections::BTreeMap,
   fs,
   io::Read,
   path::{Component, Path, PathBuf},
+  sync::Arc,
 };
 
 use serde::de::{
@@ -62,6 +63,10 @@ pub(super) struct Graph {
   pub(super) dependencies: Vec<Dependency>,
   pub(super) contents: BTreeMap<PathBuf, String>,
   pub(super) has_untracked_remote: bool,
+  pub(super) root_env_files: Vec<PathBuf>,
+  // Loading contexts contain effective environment values and must not be sent in responses.
+  pub(super) contexts: Vec<LoadContext>,
+  state_bytes: usize,
 }
 
 pub(super) fn inspect(
@@ -84,14 +89,17 @@ pub(super) fn inspect_within(
     root_walker(directory, roots, source_root)?;
   let roots = walker.graph.roots.clone();
   let project_directory = roots[0].parent().unwrap().to_path_buf();
-  let environment = walker.environment(
+  let (environment, root_env_files) = walker.environment(
     &directory,
     &project_directory,
     env_files,
     environment,
     true,
   )?;
+  charge_paths(&mut walker.state_bytes, &root_env_files)?;
+  walker.graph.root_env_files = root_env_files;
   walker.load(&roots, &project_directory, environment, &[], 0)?;
+  walker.graph.state_bytes = walker.state_bytes;
   Ok(walker.graph)
 }
 
@@ -121,10 +129,13 @@ fn root_walker(
       dependencies: Vec::new(),
       contents: BTreeMap::new(),
       has_untracked_remote: false,
+      root_env_files: Vec::new(),
+      contexts: Vec::new(),
+      state_bytes: 0,
     },
     bytes: 0,
     state_bytes: 0,
-    loaded: BTreeSet::new(),
+    loaded: BTreeMap::new(),
     source_root,
   };
   Ok((directory, walker))
@@ -159,6 +170,7 @@ pub(super) fn inspect_roots(
     }
     walker.state_bytes -= bytes;
   }
+  walker.graph.state_bytes = walker.state_bytes;
   Ok((walker.graph, includes))
 }
 
@@ -169,22 +181,12 @@ pub(super) fn with_files(
   source_root: Option<&Path>,
 ) -> Result<Graph, IncludeError> {
   let bytes = graph.contents.values().map(String::len).sum();
-  let mut state_bytes = 0;
-  for dependency in &graph.dependencies {
-    charge_bytes(
-      &mut state_bytes,
-      descriptor_bytes(
-        &dependency.path,
-        &dependency.project_directory,
-      )?,
-      MAX_STATE_BYTES,
-    )?;
-  }
+  let state_bytes = graph.state_bytes;
   let mut walker = Walker {
     graph,
     bytes,
     state_bytes,
-    loaded: BTreeSet::new(),
+    loaded: BTreeMap::new(),
     source_root: source_root.map(canonical).transpose()?,
   };
   for file in files {
@@ -225,6 +227,7 @@ pub(super) fn with_files(
       dependency.policy = Some(file.clone());
     }
   }
+  walker.graph.state_bytes = walker.state_bytes;
   Ok(walker.graph)
 }
 
@@ -270,10 +273,25 @@ pub(super) async fn inspect_and_run_config<T>(
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
-struct Context {
-  paths: Vec<PathBuf>,
-  project_directory: PathBuf,
-  environment: BTreeMap<String, String>,
+pub(super) struct Context {
+  pub(super) paths: Vec<PathBuf>,
+  pub(super) project_directory: PathBuf,
+  pub(super) environment: BTreeMap<String, String>,
+}
+
+#[derive(PartialEq, Eq)]
+pub(super) struct LoadContext {
+  pub(super) context: Arc<Context>,
+  pub(super) source_identities: Vec<PathBuf>,
+  pub(super) includes: Vec<IncludeEdge>,
+}
+
+#[derive(PartialEq, Eq)]
+pub(super) struct IncludeEdge {
+  pub(super) declaring_file: usize,
+  pub(super) include_index: usize,
+  pub(super) child: Option<usize>,
+  pub(super) env_files: Vec<PathBuf>,
 }
 
 struct ModelBudget {
@@ -385,7 +403,7 @@ struct Walker {
   graph: Graph,
   bytes: usize,
   state_bytes: usize,
-  loaded: BTreeSet<Context>,
+  loaded: BTreeMap<Arc<Context>, usize>,
   source_root: Option<PathBuf>,
 }
 
@@ -469,7 +487,8 @@ impl Walker {
     files: &[String],
     mut inherited: BTreeMap<String, String>,
     is_root: bool,
-  ) -> Result<BTreeMap<String, String>, IncludeError> {
+  ) -> Result<(BTreeMap<String, String>, Vec<PathBuf>), IncludeError>
+  {
     if let Some(root) = &self.source_root {
       ensure_within(root, project_directory)?;
     }
@@ -538,8 +557,17 @@ impl Walker {
           value,
         )?;
       }
-      loaded.push((path, text));
+      let identity = self
+        .graph
+        .dependencies
+        .last()
+        .expect("environment read records a dependency")
+        .path
+        .clone();
+      loaded.push((path, identity, text));
     }
+    let sources =
+      loaded.iter().map(|(_, path, _)| path.clone()).collect();
     if is_root {
       for (key, value) in &from_files {
         if key.starts_with("COMPOSE_") && !inherited.contains_key(key)
@@ -554,7 +582,7 @@ impl Walker {
       from_files.clear();
       file_bytes = 0;
       if !disabled_after_preload {
-        for (path, text) in loaded {
+        for (path, _, text) in loaded {
           let lookup = merge_environment(&from_files, &inherited)?;
           let parsed = parse_environment(&text, &lookup).map_err(
             |mut err| {
@@ -581,7 +609,7 @@ impl Walker {
         value,
       )?;
     }
-    Ok(from_files)
+    Ok((from_files, sources))
   }
 
   fn load(
@@ -591,7 +619,7 @@ impl Walker {
     environment: BTreeMap<String, String>,
     ancestors: &[PathBuf],
     depth: usize,
-  ) -> Result<(), IncludeError> {
+  ) -> Result<usize, IncludeError> {
     if depth > MAX_DEPTH {
       return Err(error(
         ErrorKind::Limit,
@@ -613,8 +641,14 @@ impl Walker {
       project_directory: project_directory.to_path_buf(),
       environment,
     };
-    if self.loaded.contains(&context) {
-      return Ok(());
+    if let Some(index) = self.loaded.get(&context) {
+      if self.graph.contexts[*index].source_identities != identities {
+        return Err(error(
+          ErrorKind::SourceChanged,
+          paths.first().map(PathBuf::as_path),
+        ));
+      }
+      return Ok(*index);
     }
     let mut context_bytes = environment_bytes(&context.environment)?;
     charge_bytes(&mut context_bytes, 128, MAX_STATE_BYTES)?;
@@ -636,14 +670,37 @@ impl Walker {
       context_bytes,
       MAX_STATE_BYTES,
     )?;
-    for (path, identity) in paths.iter().zip(identities) {
+    let context = Arc::new(context);
+    let index = self.graph.contexts.len();
+    self.graph.contexts.push(LoadContext {
+      context: Arc::clone(&context),
+      source_identities: Vec::new(),
+      includes: Vec::new(),
+    });
+    for (declaring_file, (path, identity)) in
+      paths.iter().zip(identities).enumerate()
+    {
       let mut declaring_ancestors = ancestors.to_vec();
-      declaring_ancestors.push(identity);
+      declaring_ancestors.push(identity.clone());
       let text = self.read(
         path,
         DependencyKind::Compose,
         project_directory,
       )?;
+      if self
+        .graph
+        .dependencies
+        .last()
+        .is_none_or(|dependency| dependency.path != identity)
+      {
+        return Err(error(ErrorKind::SourceChanged, Some(path)));
+      }
+      charge_bytes(
+        &mut self.state_bytes,
+        24 + identity.as_os_str().len(),
+        MAX_STATE_BYTES,
+      )?;
+      self.graph.contexts[index].source_identities.push(identity);
       let model_bytes = model_bytes(&text).map_err(|mut error| {
         error.path = Some(path.clone());
         error
@@ -674,8 +731,8 @@ impl Walker {
         let includes = include.as_sequence().ok_or_else(|| {
           error(ErrorKind::UnsupportedForm, Some(path))
         })?;
-        for include in includes {
-          self
+        for (include_index, include) in includes.iter().enumerate() {
+          let (child, env_files) = self
             .include(
               include,
               project_directory,
@@ -689,14 +746,22 @@ impl Walker {
               }
               err
             })?;
+          charge_bytes(&mut self.state_bytes, 64, MAX_STATE_BYTES)?;
+          charge_paths(&mut self.state_bytes, &env_files)?;
+          self.graph.contexts[index].includes.push(IncludeEdge {
+            declaring_file,
+            include_index,
+            child,
+            env_files,
+          });
         }
         Ok(())
       })();
       self.state_bytes -= model_bytes;
       result?;
     }
-    self.loaded.insert(context);
-    Ok(())
+    self.loaded.insert(context, index);
+    Ok(index)
   }
 
   fn include(
@@ -706,7 +771,7 @@ impl Walker {
     environment: &BTreeMap<String, String>,
     ancestors: &[PathBuf],
     depth: usize,
-  ) -> Result<(), IncludeError> {
+  ) -> Result<(Option<usize>, Vec<PathBuf>), IncludeError> {
     let (paths, directory, env_files) = match include {
       Value::String(path) => (vec![path.clone()], None, Vec::new()),
       Value::Mapping(fields) => {
@@ -748,7 +813,7 @@ impl Walker {
       .collect::<Result<Vec<_>, _>>()?;
     if expanded.iter().any(|path| is_remote_reference(path)) {
       self.graph.has_untracked_remote = true;
-      return Ok(());
+      return Ok((None, Vec::new()));
     }
     let paths = expanded
       .iter()
@@ -772,21 +837,36 @@ impl Walker {
       .iter()
       .map(|file| expand(file, environment))
       .collect::<Result<Vec<_>, _>>()?;
-    let environment = self.environment(
+    let (environment, env_files) = self.environment(
       declaring_directory,
       &project_directory,
       &env_files,
       environment.clone(),
       false,
     )?;
-    self.load(
+    let index = self.load(
       &paths,
       &project_directory,
       environment,
       ancestors,
       depth,
-    )
+    )?;
+    Ok((Some(index), env_files))
   }
+}
+
+fn charge_paths(
+  bytes: &mut usize,
+  paths: &[PathBuf],
+) -> Result<(), IncludeError> {
+  for path in paths {
+    charge_bytes(
+      bytes,
+      24 + path.as_os_str().len(),
+      MAX_STATE_BYTES,
+    )?;
+  }
+  Ok(())
 }
 
 fn strings(value: &Value) -> Result<Vec<String>, IncludeError> {
@@ -2000,6 +2080,124 @@ pub(crate) mod tests {
         &fixture.root.join(directory).join("child.yaml")
       ));
     }
+    Ok(())
+  }
+
+  #[test]
+  fn compose_include_capture_preserves_loading_contexts()
+  -> anyhow::Result<()> {
+    let fixture = Fixture::new("nested")?;
+    fs::write(
+      fixture.root.join("compose.yaml"),
+      "include:\n  - path: common.yaml\n    project_directory: a\n  - path: common.yaml\n    project_directory: b\n",
+    )?;
+    fs::write(
+      fixture.root.join("common.yaml"),
+      "include: [\"${LEAF:?required}\"]\n",
+    )?;
+    for directory in ["a", "b"] {
+      fs::create_dir(fixture.root.join(directory))?;
+      fs::write(
+        fixture.root.join(directory).join(".env"),
+        "LEAF=child.yaml\n",
+      )?;
+      fs::write(
+        fixture.root.join(directory).join("child.yaml"),
+        "services: {}\n",
+      )?;
+    }
+    let graph = graph(&fixture, Default::default())?;
+    let root = &graph.contexts[0];
+    assert_eq!(
+      root.context.paths,
+      [fixture.root.join("compose.yaml")]
+    );
+    assert_eq!(root.includes.len(), 2);
+    for (edge, directory) in root.includes.iter().zip(["a", "b"]) {
+      assert_eq!(edge.declaring_file, 0);
+      let context = &graph.contexts[edge.child.unwrap()];
+      assert_eq!(
+        context.context.paths,
+        [fixture.root.join("common.yaml")]
+      );
+      assert_eq!(
+        context.context.project_directory,
+        fixture.root.join(directory)
+      );
+      assert_eq!(
+        edge.env_files,
+        [fixture.root.join(directory).join(".env")]
+      );
+      let child = &graph.contexts[context.includes[0].child.unwrap()];
+      assert_eq!(
+        child.context.paths,
+        [fixture.root.join(directory).join("child.yaml")]
+      );
+    }
+    Ok(())
+  }
+
+  #[test]
+  fn compose_include_capture_keeps_ordered_roots_and_env_sources()
+  -> anyhow::Result<()> {
+    let fixture = Fixture::new("nested")?;
+    for (name, contents) in [
+      (
+        "compose.yaml",
+        "include:\n  - path: common.yaml\n    env_file: [first.env, second.env]\n",
+      ),
+      (
+        "override.yaml",
+        "include:\n  - path: common.yaml\n    env_file: [equivalent.env]\n",
+      ),
+      ("common.yaml", "services: {}\n"),
+      ("root-first.env", "ROOT=first\n"),
+      ("root-second.env", "ROOT=second\n"),
+      ("first.env", "VALUE=first\n"),
+      ("second.env", "VALUE=second\n"),
+      ("equivalent.env", "VALUE=second\n"),
+    ] {
+      fs::write(fixture.root.join(name), contents)?;
+    }
+    let graph = inspect(
+      &fixture.root,
+      &["compose.yaml".into(), "override.yaml".into()],
+      &["root-first.env".into(), "root-second.env".into()],
+      Default::default(),
+    )?;
+    assert_eq!(
+      graph.root_env_files,
+      [
+        fixture.root.join("root-first.env"),
+        fixture.root.join("root-second.env"),
+      ]
+    );
+    let root = &graph.contexts[0];
+    assert_eq!(
+      root.context.paths,
+      [
+        fixture.root.join("compose.yaml"),
+        fixture.root.join("override.yaml"),
+      ]
+    );
+    assert_eq!(root.context.environment["ROOT"], "second");
+    assert_eq!(root.includes.len(), 2);
+    assert_eq!(root.includes[0].declaring_file, 0);
+    assert_eq!(root.includes[1].declaring_file, 1);
+    assert_eq!(root.includes[0].include_index, 0);
+    assert_eq!(root.includes[1].include_index, 0);
+    assert_eq!(root.includes[0].child, root.includes[1].child);
+    assert_eq!(
+      root.includes[0].env_files,
+      [
+        fixture.root.join("first.env"),
+        fixture.root.join("second.env")
+      ]
+    );
+    assert_eq!(
+      root.includes[1].env_files,
+      [fixture.root.join("equivalent.env")]
+    );
     Ok(())
   }
 

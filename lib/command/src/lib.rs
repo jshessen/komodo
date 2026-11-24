@@ -195,6 +195,7 @@ async fn run_command(
     cancel,
     stdin,
     env,
+    clear_env,
     output_limit,
     inherit_process_group,
   } = options;
@@ -204,6 +205,9 @@ async fn run_command(
     return CommandOutput::from_err_message(
       "Inherited process-group commands require parent timeout/cancellation".into(),
     );
+  }
+  if clear_env {
+    cmd.env_clear();
   }
   if let Some(env) = env {
     cmd.envs(env);
@@ -242,11 +246,11 @@ async fn run_command(
 
   // Place the child in a new process group so the whole group can be
   // signalled together. Only needed when there is something to signal on.
-  if !inherit_process_group
+  let owns_process_group = !inherit_process_group
     && (timeout.is_some()
       || cancel.is_some()
-      || output_limit.is_some())
-  {
+      || output_limit.is_some());
+  if owns_process_group {
     cmd.process_group(0);
   }
 
@@ -270,7 +274,9 @@ async fn run_command(
   }
 
   // The child's pid is also its pgid only when we own the process group.
-  let pid = child.id();
+  let mut group = ProcessGroupGuard(
+    owns_process_group.then(|| child.id()).flatten(),
+  );
 
   let output = async move {
     match output_limit {
@@ -282,8 +288,8 @@ async fn run_command(
   // Nothing to signal on, so just wait for it to finish.
   if timeout.is_none() && cancel.is_none() {
     let output = output.await;
-    if output_limit.is_some() && !inherit_process_group {
-      kill_process_group(pid);
+    if output_limit.is_none() {
+      group.disarm();
     }
     return CommandOutput::from(output);
   }
@@ -305,8 +311,8 @@ async fn run_command(
 
   let killed_reason = tokio::select! {
     output = output => {
-      if output_limit.is_some() && !inherit_process_group {
-        kill_process_group(pid);
+      if output_limit.is_none() {
+        group.disarm();
       }
       return CommandOutput::from(output);
     }
@@ -320,7 +326,6 @@ async fn run_command(
     }
   };
 
-  kill_process_group(pid);
   CommandOutput::from_err_message(killed_reason)
 }
 
@@ -371,6 +376,20 @@ async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(
 /// A negative pid targets the whole group, so a child spawned with
 /// `process_group(0)` (group leader) is killed along with all of its
 /// descendants.
+struct ProcessGroupGuard(Option<u32>);
+
+impl ProcessGroupGuard {
+  fn disarm(&mut self) {
+    self.0 = None;
+  }
+}
+
+impl Drop for ProcessGroupGuard {
+  fn drop(&mut self) {
+    kill_process_group(self.0);
+  }
+}
+
 fn kill_process_group(pid: Option<u32>) {
   let Some(pid) = pid else {
     return;
@@ -389,6 +408,21 @@ mod tests {
   use tokio_util::sync::CancellationToken;
 
   use super::*;
+
+  #[tokio::test]
+  async fn compose_include_command_can_clear_inherited_environment() {
+    let env = std::collections::BTreeMap::from([(
+      "KOMODO_CAPTURED_VALUE".to_string(),
+      "captured".to_string(),
+    )]);
+    let output = run_standard_command(
+      "/usr/bin/env",
+      CommandOptions::default().clear_env(true).env(&env),
+    )
+    .await;
+    assert!(output.success(), "{output:?}");
+    assert_eq!(output.stdout, "KOMODO_CAPTURED_VALUE=captured\n");
+  }
 
   #[tokio::test]
   async fn compose_include_output_limit_exact_boundary() {
@@ -503,6 +537,67 @@ mod tests {
     }
     kill_process_group(Some(*group));
     panic!("owned descendant survived bounded command completion");
+  }
+
+  #[cfg(target_os = "linux")]
+  #[tokio::test]
+  async fn compose_include_dropped_command_kills_descendants() {
+    let directory = std::env::temp_dir().join(format!(
+      "komodo-command-drop-{}-{}",
+      std::process::id(),
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let pid_file = directory.join("child");
+    let path = shlex::try_quote(pid_file.to_str().unwrap()).unwrap();
+    let command = format!(
+      "sleep 30 >/dev/null 2>&1 & printf '%s' \"$!\" > {path}; wait"
+    );
+    let task = tokio::spawn(async move {
+      run_shell_command(
+        &command,
+        CommandOptions::default().output_limit(1024),
+      )
+      .await
+    });
+    let mut child = None;
+    for _ in 0..100 {
+      if let Ok(pid) = std::fs::read_to_string(&pid_file)
+        && let Ok(pid) = pid.parse::<u32>()
+      {
+        child = Some(pid);
+        break;
+      }
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    task.abort();
+    let _ = task.await;
+    std::fs::remove_file(&pid_file).unwrap();
+    std::fs::remove_dir(&directory).unwrap();
+    let child = child.expect("command did not start its descendant");
+    for _ in 0..100 {
+      match std::fs::read_to_string(format!("/proc/{child}/stat")) {
+        Ok(stat)
+          if stat.rsplit_once(") ").unwrap().1.starts_with('Z') =>
+        {
+          return;
+        }
+        Err(error)
+          if error.kind() == std::io::ErrorKind::NotFound
+            || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+          return;
+        }
+        Err(error) => {
+          panic!("cannot check owned descendant: {error}")
+        }
+        _ => tokio::time::sleep(Duration::from_millis(10)).await,
+      }
+    }
+    panic!("owned descendant survived dropping the command future");
   }
 
   #[tokio::test]

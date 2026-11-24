@@ -197,6 +197,39 @@ mod resolution_tests {
     Ok(())
   }
 
+  #[test]
+  fn compose_resolution_proof_capability_is_backward_compatible()
+  -> anyhow::Result<()> {
+    #[derive(Deserialize)]
+    struct LegacyComposeUp {
+      expected_resolution: Option<
+        komodo_client::entities::stack::AcceptedComposeResolution,
+      >,
+    }
+
+    let request = ComposeUp {
+      stack: Stack::default(),
+      services: Vec::new(),
+      repo: None,
+      git_token: None,
+      registry_token: None,
+      replacers: Vec::new(),
+      expected_resolution: None,
+      supports_deployment_proof: true,
+    };
+    let mut value = serde_json::to_value(request)?;
+    let old_worker: LegacyComposeUp =
+      serde_json::from_value(value.clone())?;
+    assert!(old_worker.expected_resolution.is_none());
+    value
+      .as_object_mut()
+      .unwrap()
+      .remove("supports_deployment_proof");
+    let old_core: ComposeUp = serde_json::from_value(value)?;
+    assert!(!old_core.supports_deployment_proof);
+    Ok(())
+  }
+
   fn request() -> ResolveComposeStack {
     let mut stack = Stack::default();
     stack.id = "a".repeat(24);
@@ -535,6 +568,9 @@ pub struct ComposeUp {
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub expected_resolution:
     Option<komodo_client::entities::stack::AcceptedComposeResolution>,
+  /// The caller can deserialize immutable deployment proof.
+  #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+  pub supports_deployment_proof: bool,
 }
 
 //

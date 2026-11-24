@@ -63,3 +63,6 @@ axum.workspace = true
 clap.workspace = true
 envy.workspace = true
 uuid.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true

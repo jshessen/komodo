@@ -30,6 +30,8 @@ pub(crate) use include::tests::Fixture;
 
 mod repository;
 pub(crate) mod resolve;
+#[cfg(target_os = "linux")]
+pub(crate) mod snapshot;
 
 #[instrument(
   "MaybeLoginRegistry",

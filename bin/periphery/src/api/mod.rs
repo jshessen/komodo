@@ -30,6 +30,8 @@ mod swarm;
 pub(crate) use compose::maybe_wrap_command;
 #[cfg(test)]
 pub(crate) use compose::observed_restart;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use compose::run_captured_command;
 
 #[derive(Debug)]
 pub struct Args {

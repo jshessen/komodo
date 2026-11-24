@@ -6,7 +6,8 @@ use tokio_util::sync::CancellationToken;
 ///
 /// Timeout, cancellation, or an output limit creates an owned process group,
 /// unless explicitly inheriting a supervised parent's group. Controls kill
-/// the owned group, not just the direct child.
+/// the owned group, not just the direct child. Dropping an in-flight
+/// controlled command also kills its owned group.
 #[derive(Default, Clone)]
 pub struct CommandOptions<'a> {
   /// Run the command at a particular path
@@ -25,8 +26,10 @@ pub struct CommandOptions<'a> {
   /// secret into the command, it never appears in the process arguments,
   /// where any user on the host could read it out of `ps`.
   pub stdin: Option<&'a str>,
-  /// Override these variables in this child only; inherit all others.
+  /// Set these variables in this child; inherit others unless cleared.
   pub env: Option<&'a BTreeMap<String, String>>,
+  /// Do not inherit the parent environment.
+  pub clear_env: bool,
   /// Maximum bytes captured from each output stream. Exceeding it fails
   /// without returning truncated output. Owned groups are cleaned up on
   /// completion, including success, to stop residual descendants.
@@ -54,6 +57,11 @@ impl<'a> CommandOptions<'a> {
     env: impl Into<Option<&'a BTreeMap<String, String>>>,
   ) -> Self {
     self.env = env.into();
+    self
+  }
+
+  pub fn clear_env(mut self, clear: bool) -> Self {
+    self.clear_env = clear;
     self
   }
 }

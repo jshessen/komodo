@@ -124,6 +124,7 @@ mod tests {
     assert!(info.deployed_resolution.is_none());
     let dependencies = vec![dependency()];
     let accepted = AcceptedComposeResolution {
+      deployment_proven: false,
       source_identity: ComposeSourceIdentity {
         request_identity: identity(),
         observed_snapshot: snapshot(&dependencies),
@@ -500,6 +501,13 @@ pub struct ComposeSourceIdentity {
 pub struct AcceptedComposeResolution {
   pub source_identity: ComposeSourceIdentity,
   pub dependencies: Vec<DerivedComposeDependency>,
+  /// True only when these inputs were immutably bound to the operation.
+  #[serde(default, skip_serializing_if = "is_unproven")]
+  pub deployment_proven: bool,
+}
+
+fn is_unproven(proven: &bool) -> bool {
+  !proven
 }
 
 #[derive(Clone, Serialize, Deserialize)]
